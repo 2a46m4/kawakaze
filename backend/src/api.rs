@@ -30,6 +30,10 @@ pub enum Endpoint {
     StartJail(String),
     /// Stop a jail: POST /jails/{name}/stop
     StopJail(String),
+    /// Bootstrap a jail: POST /jails/{name}/bootstrap
+    BootstrapJail(String),
+    /// Get bootstrap status: GET /jails/{name}/bootstrap/status
+    BootstrapStatus(String),
 }
 
 impl Endpoint {
@@ -40,6 +44,8 @@ impl Endpoint {
             Endpoint::Jail(name) => format!("jails/{}", name),
             Endpoint::StartJail(name) => format!("jails/{}/start", name),
             Endpoint::StopJail(name) => format!("jails/{}/stop", name),
+            Endpoint::BootstrapJail(name) => format!("jails/{}/bootstrap", name),
+            Endpoint::BootstrapStatus(name) => format!("jails/{}/bootstrap/status", name),
         }
     }
 }
@@ -112,6 +118,8 @@ impl Request {
             }
             ["jails", name, "start"] => Ok(Endpoint::StartJail(name.to_string())),
             ["jails", name, "stop"] => Ok(Endpoint::StopJail(name.to_string())),
+            ["jails", name, "bootstrap"] => Ok(Endpoint::BootstrapJail(name.to_string())),
+            ["jails", name, "bootstrap", "status"] => Ok(Endpoint::BootstrapStatus(name.to_string())),
             _ => Err(ApiError::BadRequest(format!("Unknown endpoint: {}", self.endpoint))),
         }
     }
@@ -205,7 +213,7 @@ pub struct ApiError {
 
 impl ApiError {
     /// Create a new API error
-    fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),
             message: message.into(),
@@ -316,6 +324,10 @@ pub struct CreateJailRequest {
     /// Optional IP address
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
+
+    /// Optional bootstrap configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap: Option<BootstrapConfig>,
 }
 
 impl CreateJailRequest {
@@ -386,6 +398,15 @@ pub struct JailListItem {
     pub running: bool,
 }
 
+/// Bootstrap configuration (re-exported from bootstrap module)
+pub type BootstrapConfig = crate::bootstrap::BootstrapConfig;
+
+/// Bootstrap progress status (re-exported from bootstrap module)
+pub type BootstrapProgress = crate::bootstrap::BootstrapProgress;
+
+/// Request body for bootstrapping a jail
+pub type BootstrapRequest = BootstrapConfig;
+
 impl From<(String, JailState)> for JailListItem {
     fn from((name, state): (String, JailState)) -> Self {
         Self {
@@ -421,6 +442,7 @@ mod tests {
             name: "test_jail".into(),
             path: Some("/tmp/test".into()),
             ip: None,
+            bootstrap: None,
         };
         let req = Request::post(Endpoint::Jails, body).unwrap();
         assert_eq!(req.method, Method::Post);
@@ -493,6 +515,7 @@ mod tests {
             name: "valid_name-123".into(),
             path: Some("/tmp/test".into()),
             ip: None,
+            bootstrap: None,
         };
         assert!(req.validate().is_ok());
 
@@ -500,6 +523,7 @@ mod tests {
             name: "".into(),
             path: None,
             ip: None,
+            bootstrap: None,
         };
         assert!(req.validate().is_err());
 
@@ -507,6 +531,7 @@ mod tests {
             name: "invalid name!".into(),
             path: None,
             ip: None,
+            bootstrap: None,
         };
         assert!(req.validate().is_err());
     }

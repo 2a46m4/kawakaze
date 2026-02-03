@@ -6,8 +6,9 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::api::{
-    ApiError, CreateJailRequest, Endpoint, JailInfo, JailListItem, Request, Response,
+    ApiError, BootstrapRequest, CreateJailRequest, Endpoint, JailInfo, JailListItem, Request, Response,
 };
+use crate::bootstrap::{Bootstrap, BootstrapConfig};
 use crate::JailManager;
 
 /// Handle an API request and return a response
@@ -25,6 +26,7 @@ pub async fn handle_request(
     match (&request.method, &endpoint) {
         (crate::api::Method::Get, Endpoint::Jails) => list_jails(manager).await,
         (crate::api::Method::Get, Endpoint::Jail(name)) => get_jail(manager, name).await,
+        (crate::api::Method::Get, Endpoint::BootstrapStatus(name)) => get_bootstrap_progress(manager, name).await,
         (crate::api::Method::Post, Endpoint::Jails) => {
             match serde_json::from_value::<CreateJailRequest>(request.body) {
                 Ok(create_req) => create_jail(manager, create_req).await,
@@ -33,6 +35,12 @@ pub async fn handle_request(
         }
         (crate::api::Method::Post, Endpoint::StartJail(name)) => start_jail(manager, name).await,
         (crate::api::Method::Post, Endpoint::StopJail(name)) => stop_jail(manager, name).await,
+        (crate::api::Method::Post, Endpoint::BootstrapJail(name)) => {
+            match serde_json::from_value::<BootstrapRequest>(request.body) {
+                Ok(config) => bootstrap_jail(manager, name, config).await,
+                Err(err) => Response::bad_request(format!("Invalid request body: {}", err)),
+            }
+        }
         (crate::api::Method::Delete, Endpoint::Jail(name)) => delete_jail(manager, name).await,
         _ => Response::bad_request(format!(
             "Method {:?} not supported for endpoint {}",
@@ -220,6 +228,99 @@ async fn delete_jail(manager: Arc<Mutex<JailManager>>, name: &str) -> Response {
     }
 }
 
+/// Bootstrap a jail
+async fn bootstrap_jail(
+    manager: Arc<Mutex<JailManager>>,
+    name: &str,
+    config: BootstrapConfig,
+) -> Response {
+    // First check if jail exists
+    let jail_path = {
+        let mgr = manager.lock().await;
+        match mgr.get_jail(name) {
+            Some(jail) => {
+                // Get the jail path
+                match jail.info().path {
+                    Some(ref p) => p.clone(),
+                    None => {
+                        // Use default path
+                        format!("/tmp/{}", name)
+                    }
+                }
+            }
+            None => return Response::not_found(format!("Jail '{}'", name)),
+        }
+    };
+
+    // Check if already bootstrapped
+    if Bootstrap::is_bootstrapped(&jail_path) {
+        return Response::conflict(format!(
+            "Jail '{}' is already bootstrapped",
+            name
+        ));
+    }
+
+    // Start bootstrap in background
+    let jail_name = name.to_string();
+    let manager_clone = manager.clone();
+    let jail_path_clone = jail_path.clone();
+
+    tokio::spawn(async move {
+        // Create progress channel
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(100);
+
+        // Store the progress sender in the manager
+        {
+            let mut mgr = manager_clone.lock().await;
+            mgr.register_bootstrap_tracker(jail_name.clone(), progress_tx.clone()).await;
+        }
+
+        // Spawn a task to forward progress updates to the manager
+        let manager_for_progress = manager_clone.clone();
+        let jail_name_for_progress = jail_name.clone();
+        tokio::spawn(async move {
+            while let Some(progress) = progress_rx.recv().await {
+                let mut mgr = manager_for_progress.lock().await;
+                // Update the stored progress
+                if let Some(stored) = mgr.bootstrap_progress.get_mut(&jail_name_for_progress) {
+                    *stored = progress.clone();
+                }
+            }
+        });
+
+        // Create and run bootstrap
+        let bootstrap = match Bootstrap::new(&jail_path_clone, config, progress_tx) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::error!("Failed to create bootstrap instance: {}", e);
+                return;
+            }
+        };
+
+        if let Err(e) = bootstrap.run().await {
+            tracing::error!("Bootstrap failed for jail '{}': {}", jail_name, e);
+        }
+    });
+
+    // Return immediately with 202 Accepted
+    Response::error(202, ApiError::new("BOOTSTRAP_STARTED", format!("Bootstrap started for jail '{}'", name)))
+}
+
+/// Get bootstrap progress for a jail
+async fn get_bootstrap_progress(manager: Arc<Mutex<JailManager>>, name: &str) -> Response {
+    let mgr = manager.lock().await;
+
+    match mgr.get_bootstrap_progress(name).await {
+        Some(progress) => {
+            match Response::success(progress) {
+                Ok(resp) => resp,
+                Err(_) => Response::internal_error("Failed to serialize progress"),
+            }
+        }
+        None => Response::not_found(format!("No bootstrap progress for jail '{}'", name)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +384,7 @@ mod tests {
             name: "new_jail".into(),
             path: Some("/tmp/new_jail".into()),
             ip: Some("192.168.1.100".into()),
+            bootstrap: None,
         };
 
         let request = Request::post(crate::api::Endpoint::Jails, create_req).unwrap();
@@ -300,6 +402,7 @@ mod tests {
             name: "invalid name!".into(),
             path: None,
             ip: None,
+            bootstrap: None,
         };
 
         let request = Request::post(crate::api::Endpoint::Jails, create_req).unwrap();
@@ -322,6 +425,7 @@ mod tests {
             name: "existing_jail".into(),
             path: None,
             ip: None,
+            bootstrap: None,
         };
 
         let request = Request::post(crate::api::Endpoint::Jails, create_req).unwrap();
@@ -403,6 +507,7 @@ mod tests {
             name: "new_jail".into(),
             path: None,
             ip: None,
+            bootstrap: None,
         };
 
         let response = create_jail(manager, request).await;
@@ -419,6 +524,7 @@ mod tests {
             name: "".into(),
             path: None,
             ip: None,
+            bootstrap: None,
         };
 
         let response = create_jail(manager, request).await;

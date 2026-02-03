@@ -8,12 +8,18 @@ pub mod api;
 pub mod handler;
 pub mod server;
 pub mod store;
+pub mod bootstrap;
 
 use crate::jail::{Jail, JailError, JailState};
 use crate::store::{JailStore, StoreError};
+use crate::bootstrap::{BootstrapProgress, BootstrapStatus};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Type for bootstrap progress sender
+pub type BootstrapProgressSender = mpsc::Sender<BootstrapProgress>;
 
 /// Jail manager - handles jail lifecycle
 pub struct JailManager {
@@ -21,6 +27,10 @@ pub struct JailManager {
     pub(crate) jails: HashMap<String, Jail>,
     running: bool,
     store: Option<JailStore>,
+    /// Bootstrap progress trackers (jail name -> progress sender)
+    pub bootstrap_tracker: HashMap<String, BootstrapProgressSender>,
+    /// Bootstrap progress state (jail name -> latest progress)
+    pub bootstrap_progress: HashMap<String, BootstrapProgress>,
 }
 
 impl JailManager {
@@ -31,6 +41,8 @@ impl JailManager {
             jails: HashMap::new(),
             running: false,
             store: None,
+            bootstrap_tracker: HashMap::new(),
+            bootstrap_progress: HashMap::new(),
         }
     }
 
@@ -48,6 +60,8 @@ impl JailManager {
             jails: HashMap::new(),
             running: false,
             store: Some(store),
+            bootstrap_tracker: HashMap::new(),
+            bootstrap_progress: HashMap::new(),
         })
     }
 
@@ -65,6 +79,8 @@ impl JailManager {
             jails: HashMap::new(),
             running: false,
             store: Some(store),
+            bootstrap_tracker: HashMap::new(),
+            bootstrap_progress: HashMap::new(),
         })
     }
 
@@ -298,6 +314,64 @@ impl JailManager {
     /// Get the socket path
     pub fn socket_path(&self) -> &PathBuf {
         &self.socket_path
+    }
+
+    /// Register a bootstrap progress tracker for a jail
+    pub async fn register_bootstrap_tracker(&mut self, name: String, sender: BootstrapProgressSender) {
+        // Store the sender for later use
+        self.bootstrap_tracker.insert(name.clone(), sender);
+
+        // Initialize progress with defaults
+        self.bootstrap_progress.insert(name, BootstrapProgress {
+            status: BootstrapStatus::Initializing,
+            progress: 0,
+            current_step: "Bootstrap starting...".to_string(),
+            version: "unknown".to_string(),
+            architecture: "unknown".to_string(),
+        });
+    }
+
+    /// Get the current bootstrap progress for a jail
+    pub async fn get_bootstrap_progress(&self, name: &str) -> Option<BootstrapProgress> {
+        self.bootstrap_progress.get(name).cloned()
+    }
+
+    /// Send a bootstrap progress update
+    pub async fn send_bootstrap_progress(&mut self, name: &str, status: BootstrapStatus) -> Result<(), mpsc::error::SendError<BootstrapProgress>> {
+        if let Some(progress) = self.bootstrap_progress.get_mut(name) {
+            progress.status = status.clone();
+            match &status {
+                BootstrapStatus::Complete => progress.progress = 100,
+                BootstrapStatus::Failed(_) => progress.progress = 0,
+                _ => {}
+            }
+            progress.current_step = match &status {
+                BootstrapStatus::Complete => "Bootstrap completed".to_string(),
+                BootstrapStatus::Failed(msg) => format!("Bootstrap failed: {}", msg),
+                _ => "In progress".to_string(),
+            };
+
+            // Send update through the channel
+            if let Some(sender) = self.bootstrap_tracker.get(name) {
+                let _ = sender.try_send(progress.clone());
+            }
+
+            Ok(())
+        } else {
+            Err(mpsc::error::SendError(BootstrapProgress {
+                status,
+                progress: 0,
+                current_step: "".to_string(),
+                version: "".to_string(),
+                architecture: "".to_string(),
+            }))
+        }
+    }
+
+    /// Remove bootstrap tracker for a jail
+    pub async fn remove_bootstrap_tracker(&mut self, name: &str) {
+        self.bootstrap_tracker.remove(name);
+        self.bootstrap_progress.remove(name);
     }
 }
 

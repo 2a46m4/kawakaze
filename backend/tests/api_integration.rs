@@ -101,6 +101,7 @@ async fn test_create_and_list_jails() {
         name: "test_jail".into(),
         path: Some("/tmp/test_jail_path".into()),
         ip: None,
+        bootstrap: None,
     };
     let request = Request::post(Endpoint::Jails, create_req).unwrap();
     let response = send_request(socket_path, request).await.unwrap();
@@ -132,6 +133,7 @@ async fn test_get_jail() {
         name: "my_jail".into(),
         path: None,
         ip: None,
+        bootstrap: None,
     };
     let request = Request::post(Endpoint::Jails, create_req).unwrap();
     send_request(socket_path, request).await.unwrap();
@@ -177,6 +179,7 @@ async fn test_create_invalid_jail_name() {
         name: "invalid name!".into(),
         path: None,
         ip: None,
+        bootstrap: None,
     };
     let request = Request::post(Endpoint::Jails, create_req).unwrap();
     let response = send_request(socket_path, request).await.unwrap();
@@ -200,6 +203,7 @@ async fn test_create_duplicate_jail() {
         name: "duplicate".into(),
         path: None,
         ip: None,
+        bootstrap: None,
     };
     let request = Request::post(Endpoint::Jails, create_req.clone()).unwrap();
     send_request(socket_path, request).await.unwrap();
@@ -227,6 +231,7 @@ async fn test_delete_jail() {
         name: "to_delete".into(),
         path: None,
         ip: None,
+        bootstrap: None,
     };
     let request = Request::post(Endpoint::Jails, create_req).unwrap();
     send_request(socket_path, request).await.unwrap();
@@ -279,6 +284,7 @@ async fn test_concurrent_requests() {
                 name: format!("jail{}", i),
                 path: None,
                 ip: None,
+                bootstrap: None,
             };
             let request = Request::post(Endpoint::Jails, &create_req).unwrap();
             send_request(&socket_path, request).await
@@ -360,6 +366,7 @@ async fn test_create_jail_with_path_and_ip() {
         name: "configured_jail".into(),
         path: Some("/jails/configured".into()),
         ip: Some("192.168.1.100".into()),
+        bootstrap: None,
     };
     let request = Request::post(Endpoint::Jails, create_req).unwrap();
     let response = send_request(socket_path, request).await.unwrap();
@@ -391,6 +398,7 @@ async fn test_multiple_operations_same_jail() {
         name: "ops_jail".into(),
         path: None,
         ip: None,
+        bootstrap: None,
     };
     let request = Request::post(Endpoint::Jails, create_req).unwrap();
     let response = send_request(socket_path, request).await.unwrap();

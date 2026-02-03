@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "example_jail".into(),
         path: Some("/tmp/example_jail".into()),
         ip: Some("192.168.1.100".into()),
+        bootstrap: None,
     };
     let request = Request::post(Endpoint::Jails, create_req)?;
     let response = send_request(request).await?;
@@ -124,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "webserver".into(),
         path: Some("/jails/webserver".into()),
         ip: None,
+        bootstrap: None,
     };
     let request = Request::post(Endpoint::Jails, create_req)?;
     let response = send_request(request).await?;
@@ -151,6 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "example_jail".into(), // Already exists
         path: None,
         ip: None,
+        bootstrap: None,
     };
     let request = Request::post(Endpoint::Jails, create_req)?;
     let response = send_request(request).await?;
@@ -205,6 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         name: "invalid name!".into(),
         path: None,
         ip: None,
+        bootstrap: None,
     };
     let request = Request::post(Endpoint::Jails, create_req)?;
     let response = send_request(request).await?;

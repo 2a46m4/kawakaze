@@ -244,6 +244,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_start_jail() {
+        // Skip if not running as root
+        #[cfg(unix)]
+        if unsafe { libc::getuid() } != 0 {
+            return;
+        }
+
         let mut manager = JailManager::new("/tmp/test.sock");
         manager.add_jail("test_jail").unwrap();
 
@@ -271,6 +277,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_stop_jail() {
+        // Skip if not running as root
+        #[cfg(unix)]
+        if unsafe { libc::getuid() } != 0 {
+            return;
+        }
+
         let mut manager = JailManager::new("/tmp/test.sock");
         manager.add_jail("test_jail").unwrap();
         manager.start_jail("test_jail").unwrap();
@@ -299,6 +311,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_remove_jail() {
+        // Skip if not running as root
+        #[cfg(unix)]
+        if unsafe { libc::getuid() } != 0 {
+            return;
+        }
+
         let mut manager = JailManager::new("/tmp/test.sock");
         manager.add_jail("test_jail").unwrap();
         manager.start_jail("test_jail").unwrap();
@@ -342,6 +360,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_manager_stops_jails_on_shutdown() {
+        // Skip if not running as root
+        #[cfg(unix)]
+        if unsafe { libc::getuid() } != 0 {
+            return;
+        }
+
         let mut manager = JailManager::new("/tmp/test.sock");
 
         manager.add_jail("jail1").unwrap();

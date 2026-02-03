@@ -188,6 +188,26 @@ impl Jail {
     }
 }
 
+impl JailState {
+    /// Convert JailState to/from string for database storage
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JailState::Created => "created",
+            JailState::Running => "running",
+            JailState::Stopped => "stopped",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Result<Self, JailError> {
+        match s {
+            "created" => Ok(JailState::Created),
+            "running" => Ok(JailState::Running),
+            "stopped" => Ok(JailState::Stopped),
+            _ => Err(JailError::InvalidState(format!("Invalid jail state: {}", s))),
+        }
+    }
+}
+
 /// Jail information
 #[derive(Debug, Clone)]
 pub struct JailInfo {
@@ -195,6 +215,42 @@ pub struct JailInfo {
     pub jid: i32,
     pub state: JailState,
     pub path: Option<String>,
+}
+
+impl Jail {
+    /// Convert Jail to database row for persistence
+    pub fn to_db_row(&self) -> crate::store::JailRow {
+        crate::store::JailRow {
+            name: self.name.clone(),
+            path: self.path.clone(),
+            ip: self.ip.clone(),
+            state: self.state.as_str().to_string(),
+            jid: self.jid,
+        }
+    }
+
+    /// Create Jail from database row
+    pub fn from_db_row(row: crate::store::JailRow) -> Result<Self, JailError> {
+        let state = JailState::from_str(&row.state)?;
+
+        Ok(Self {
+            name: row.name,
+            jid: row.jid,
+            state,
+            path: row.path,
+            ip: row.ip,
+        })
+    }
+
+    /// Set the JID (used when syncing with kernel)
+    pub(crate) fn set_jid(&mut self, jid: i32) {
+        self.jid = jid;
+    }
+
+    /// Set the state (used when syncing with kernel)
+    pub(crate) fn set_state(&mut self, state: JailState) {
+        self.state = state;
+    }
 }
 
 /// Jail operation errors
@@ -336,6 +392,22 @@ mod freebsd {
             });
         }
 
+        // Add metadata marking for FreeBSD 15.0+ (meta.managed_by=kawakaze)
+        // This allows external tools to identify Kawakaze-managed jails
+        // Note: On older FreeBSD versions without metadata support, jail_set
+        // will return EINVAL. We handle this gracefully by trying without metadata.
+        let meta_key = CString::new("meta.managed_by").unwrap();
+        let meta_value = CString::new("kawakaze").unwrap();
+
+        iovs.push(libc::iovec {
+            iov_base: meta_key.as_ptr() as *mut libc::c_void,
+            iov_len: meta_key.as_bytes().len() + 1,
+        });
+        iovs.push(libc::iovec {
+            iov_base: meta_value.as_ptr() as *mut libc::c_void,
+            iov_len: meta_value.as_bytes().len() + 1,
+        });
+
         // Call jail_set function from libc
         // Use JAIL_CREATE to create the jail, but don't attach (JAIL_ATTACH)
         // so we can continue managing it from outside the jail
@@ -346,9 +418,32 @@ mod freebsd {
         };
 
         if jid < 0 {
+            let err = std::io::Error::last_os_error();
+            // On older FreeBSD versions, metadata may not be supported (EINVAL)
+            // Retry without the metadata parameter
+            if err.raw_os_error() == Some(libc::EINVAL) {
+                tracing::debug!("Metadata parameter not supported, retrying without metadata");
+                // Remove the last two iovecs (metadata)
+                iovs.pop();
+                iovs.pop();
+
+                let jid = unsafe {
+                    libc::jail_set(iovs.as_mut_ptr(), iovs.len() as libc::c_uint, flags)
+                };
+
+                if jid < 0 {
+                    return Err(JailError::CreationFailed(format!(
+                        "jail_set failed: {}",
+                        std::io::Error::last_os_error()
+                    )));
+                }
+
+                return Ok(jid);
+            }
+
             return Err(JailError::CreationFailed(format!(
                 "jail_set failed: {}",
-                std::io::Error::last_os_error()
+                err
             )));
         }
 

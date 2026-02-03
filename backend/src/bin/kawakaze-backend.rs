@@ -28,8 +28,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Not running as root. Jail operations require root privileges.");
     }
 
-    // Create jail manager
-    let manager = Arc::new(Mutex::new(JailManager::with_default_socket()));
+    // Create jail manager with database persistence
+    let manager = match JailManager::with_default_database() {
+        Ok(m) => {
+            tracing::info!("Database persistence enabled: /var/db/kawakaze.db");
+            Arc::new(Mutex::new(m))
+        }
+        Err(e) => {
+            tracing::warn!("Failed to initialize database ({}), running without persistence", e);
+            tracing::warn!("Jails will not persist across restarts");
+            Arc::new(Mutex::new(JailManager::with_default_socket()))
+        }
+    };
 
     // Start the manager
     manager.lock().await.start().await?;

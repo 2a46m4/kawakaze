@@ -7,16 +7,20 @@ pub mod jail;
 pub mod api;
 pub mod handler;
 pub mod server;
+pub mod store;
 
-use crate::jail::{Jail, JailError};
+use crate::jail::{Jail, JailError, JailState};
+use crate::store::{JailStore, StoreError};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tracing::{debug, error, info, warn};
 
 /// Jail manager - handles jail lifecycle
 pub struct JailManager {
     pub(crate) socket_path: PathBuf,
     pub(crate) jails: HashMap<String, Jail>,
     running: bool,
+    store: Option<JailStore>,
 }
 
 impl JailManager {
@@ -26,6 +30,7 @@ impl JailManager {
             socket_path: socket_path.into(),
             jails: HashMap::new(),
             running: false,
+            store: None,
         }
     }
 
@@ -34,15 +39,135 @@ impl JailManager {
         Self::new("/var/run/kawakaze.sock")
     }
 
+    /// Create a jail manager with database persistence
+    pub fn with_database(db_path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let store = JailStore::new(db_path)?;
+
+        Ok(Self {
+            socket_path: PathBuf::from("/var/run/kawakaze.sock"),
+            jails: HashMap::new(),
+            running: false,
+            store: Some(store),
+        })
+    }
+
+    /// Create a jail manager with database persistence at default location
+    pub fn with_default_database() -> Result<Self, StoreError> {
+        Self::with_database("/var/db/kawakaze.db")
+    }
+
+    /// Create a jail manager with custom socket and database paths
+    pub fn with_paths(socket_path: impl Into<PathBuf>, db_path: impl AsRef<Path>) -> Result<Self, StoreError> {
+        let store = JailStore::new(db_path)?;
+
+        Ok(Self {
+            socket_path: socket_path.into(),
+            jails: HashMap::new(),
+            running: false,
+            store: Some(store),
+        })
+    }
+
     /// Start the jail manager service
     pub async fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.running {
             return Err("JailManager is already running".into());
         }
 
+        // Load jails from database if configured
+        if let Some(store) = self.store.clone() {
+            self.load_jails_from_db(&store)?;
+        }
+
         // Mark as running
         self.running = true;
         Ok(())
+    }
+
+    /// Load jails from database and sync JIDs with FreeBSD kernel
+    fn load_jails_from_db(&mut self, store: &JailStore) -> Result<(), Box<dyn std::error::Error>> {
+        info!("Loading jails from database: {:?}", store.db_path());
+
+        let jail_rows = store.get_all_jails()?;
+        let mut loaded_count = 0;
+
+        for row in jail_rows {
+            let name = row.name.clone();
+            match Jail::from_db_row(row) {
+                Ok(mut jail) => {
+                    // Reset JID to -1 before syncing with kernel
+                    jail.set_jid(-1);
+
+                    // Sync with FreeBSD kernel - check if jail is actually running
+                    #[cfg(target_os = "freebsd")]
+                    {
+                        let actual_jid = self.get_jid_from_kernel(jail.name());
+                        if let Some(jid) = actual_jid {
+                            jail.set_jid(jid);
+                            jail.set_state(JailState::Running);
+                            debug!("Jail '{}' is running with JID {}", jail.name(), jid);
+                        } else {
+                            // Jail is not running, ensure state is Stopped or Created
+                            if jail.state() == JailState::Running {
+                                jail.set_state(JailState::Stopped);
+                            }
+                            debug!("Jail '{}' is not running", jail.name());
+                        }
+                    }
+
+                    self.jails.insert(name.clone(), jail);
+                    loaded_count += 1;
+                }
+                Err(e) => {
+                    warn!("Failed to load jail '{}' from database: {}", name, e);
+                }
+            }
+        }
+
+        info!("Loaded {} jails from database", loaded_count);
+        Ok(())
+    }
+
+    /// Query FreeBSD kernel for JID by jail name
+    #[cfg(target_os = "freebsd")]
+    fn get_jid_from_kernel(&self, name: &str) -> Option<i32> {
+        use std::ffi::CString;
+        use std::mem;
+
+        let name_param = CString::new("name").unwrap();
+        let name_value = CString::new(name).ok()?;
+        let jid_param = CString::new("jid").unwrap();
+
+        let mut jid_out: libc::c_int = 0;
+
+        let iovs = [
+            libc::iovec {
+                iov_base: name_param.as_ptr() as *mut libc::c_void,
+                iov_len: name_param.as_bytes().len() + 1,
+            },
+            libc::iovec {
+                iov_base: name_value.as_ptr() as *mut libc::c_void,
+                iov_len: name_value.as_bytes().len() + 1,
+            },
+            libc::iovec {
+                iov_base: jid_param.as_ptr() as *mut libc::c_void,
+                iov_len: jid_param.as_bytes().len() + 1,
+            },
+            libc::iovec {
+                iov_base: &mut jid_out as *mut libc::c_int as *mut libc::c_void,
+                iov_len: mem::size_of::<libc::c_int>(),
+            },
+        ];
+
+        let result = unsafe {
+            libc::jail_get(iovs.as_ptr() as *mut libc::iovec, iovs.len() as libc::c_uint, 0)
+        };
+
+        if result > 0 {
+            Some(result)
+        } else {
+            None
+        }
     }
 
     /// Stop the jail manager service
@@ -77,6 +202,16 @@ impl JailManager {
         }
 
         let jail = Jail::create(name)?;
+
+        // Persist to database if configured
+        if let Some(ref store) = self.store {
+            let row = jail.to_db_row();
+            if let Err(e) = store.insert_jail(&row) {
+                error!("Failed to persist jail '{}' to database: {}", name, e);
+                // Continue anyway - persistence failures shouldn't block jail operations
+            }
+        }
+
         self.jails.insert(name.to_string(), jail);
         Ok(())
     }
@@ -98,7 +233,17 @@ impl JailManager {
             .get_mut(name)
             .ok_or_else(|| JailError::StartFailed(format!("Jail '{}' not found", name)))?;
 
-        jail.start()
+        jail.start()?;
+
+        // Persist state change to database if configured
+        if let Some(ref store) = self.store {
+            let row = jail.to_db_row();
+            if let Err(e) = store.update_jail(&row) {
+                error!("Failed to persist jail '{}' state to database: {}", name, e);
+            }
+        }
+
+        Ok(())
     }
 
     /// Stop a jail by name
@@ -108,7 +253,17 @@ impl JailManager {
             .get_mut(name)
             .ok_or_else(|| JailError::StopFailed(format!("Jail '{}' not found", name)))?;
 
-        jail.stop()
+        jail.stop()?;
+
+        // Persist state change to database if configured
+        if let Some(ref store) = self.store {
+            let row = jail.to_db_row();
+            if let Err(e) = store.update_jail(&row) {
+                error!("Failed to persist jail '{}' state to database: {}", name, e);
+            }
+        }
+
+        Ok(())
     }
 
     /// Remove a jail by name
@@ -118,7 +273,16 @@ impl JailManager {
             .remove(name)
             .ok_or_else(|| JailError::DestroyFailed(format!("Jail '{}' not found", name)))?;
 
-        jail.destroy()
+        jail.destroy()?;
+
+        // Remove from database if configured
+        if let Some(ref store) = self.store {
+            if let Err(e) = store.delete_jail(name) {
+                error!("Failed to delete jail '{}' from database: {}", name, e);
+            }
+        }
+
+        Ok(())
     }
 
     /// Get all jail names

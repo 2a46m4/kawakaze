@@ -4,6 +4,9 @@
 //! communicating with clients through a unix socket.
 
 pub mod jail;
+pub mod api;
+pub mod handler;
+pub mod server;
 
 use crate::jail::{Jail, JailError};
 use std::collections::HashMap;
@@ -11,8 +14,8 @@ use std::path::PathBuf;
 
 /// Jail manager - handles jail lifecycle
 pub struct JailManager {
-    socket_path: PathBuf,
-    jails: HashMap<String, Jail>,
+    pub(crate) socket_path: PathBuf,
+    pub(crate) jails: HashMap<String, Jail>,
     running: bool,
 }
 
@@ -37,8 +40,7 @@ impl JailManager {
             return Err("JailManager is already running".into());
         }
 
-        // TODO: Start unix socket listener
-        // For now, we just mark as running
+        // Mark as running
         self.running = true;
         Ok(())
     }

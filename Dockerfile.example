@@ -1,0 +1,39 @@
+# Example Dockerfile for testing
+FROM ubuntu:22.04
+
+# Set labels
+LABEL maintainer="test@example.com"
+LABEL version="1.0"
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV APP_HOME=/app
+
+# Create working directory
+WORKDIR /app
+
+# Install dependencies
+RUN apt-get update && apt-get install -y \
+    curl \
+    vim \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy files
+COPY . /app
+COPY config/production.conf /etc/app/config.conf
+
+# Add a repository
+RUN apt-get update
+
+# Expose ports
+EXPOSE 8080 8443
+
+# Set user
+USER appuser
+
+# Set volume
+VOLUME ["/data", "/logs"]
+
+# Set entrypoint and command
+ENTRYPOINT ["/app/start.sh"]
+CMD ["--server"]

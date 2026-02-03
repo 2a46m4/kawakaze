@@ -1,0 +1,8 @@
+[package]
+name = "kawakaze"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dockerfile-parser = "0.9"
+clap = { version = "4.5", features = ["derive"] }

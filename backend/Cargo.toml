@@ -5,3 +5,6 @@ edition.workspace = true
 
 [dependencies]
 # TODO: Add dependencies for unix socket communication and libjail interface
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

@@ -4,18 +4,41 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Kawakaze is a Rust project using the 2024 edition. This is a new project with minimal structure.
+Kawakaze is a jail manager for FreeBSD. The user interacts with Kawakaze using a CLI tool.
+
+### CLI
+The CLI can create, destroy, and manage jails. It is able to parse Dockerfiles and create containers that way. 
+
+### Backend
+The backend is the section that actually manages the jails. It communicates with clients through a unix socket. It should interface with the libjail library.
+
+## Workspace Structure
+
+```
+kawakaze/
+├── Cargo.toml          # Workspace definition
+└── cli/                # CLI application crate
+    ├── Cargo.toml
+    ├── src/
+    └── Dockerfile.example
+```
 
 ## Common Commands
 
-### Build
+### Build all workspace members
 ```bash
 cargo build
 ```
 
-### Run
+### Build specific package
 ```bash
-cargo run
+cargo build -p kawakaze
+```
+
+### Run the CLI
+```bash
+cargo run -p kawakaze -- <dockerfile-path>
+# Example: cargo run -p kawakaze -- cli/Dockerfile.example
 ```
 
 ### Run tests
@@ -40,4 +63,4 @@ cargo fmt
 
 ## Architecture
 
-The project is in early development stages with only a basic `main.rs` entry point.
+The workspace contains a single member `cli` which provides a command-line tool for parsing Dockerfiles using the `dockerfile-parser` library.

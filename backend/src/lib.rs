@@ -14,6 +14,7 @@ pub mod zfs;
 pub mod image;
 pub mod container;
 pub mod image_builder;
+pub mod networking;
 
 use crate::jail::{Jail, JailError, JailState};
 use crate::store::{JailStore, StoreError};
@@ -23,6 +24,7 @@ use crate::container::{Container, ContainerId};
 use crate::zfs::Zfs;
 use crate::config::KawakazeConfig;
 use crate::image_builder::ImageBuildProgress;
+use crate::networking::NetworkManager;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
@@ -53,6 +55,10 @@ pub struct JailManager {
     pub image_build_tracker: HashMap<ImageId, mpsc::Sender<ImageBuildProgress>>,
     /// Image build progress state (image ID -> latest progress)
     pub image_build_progress: HashMap<ImageId, ImageBuildProgress>,
+    /// Network manager for container networking
+    pub(crate) network_manager: Option<NetworkManager>,
+    /// Network configurations for containers (container ID -> network config)
+    pub(crate) container_networks: HashMap<ContainerId, crate::networking::ContainerNetwork>,
 }
 
 impl JailManager {
@@ -71,6 +77,8 @@ impl JailManager {
             config: KawakazeConfig::default(),
             image_build_tracker: HashMap::new(),
             image_build_progress: HashMap::new(),
+            network_manager: None,
+            container_networks: HashMap::new(),
         }
     }
 
@@ -96,6 +104,8 @@ impl JailManager {
             config: KawakazeConfig::default(),
             image_build_tracker: HashMap::new(),
             image_build_progress: HashMap::new(),
+            network_manager: None,
+            container_networks: HashMap::new(),
         })
     }
 
@@ -121,6 +131,8 @@ impl JailManager {
             config: KawakazeConfig::default(),
             image_build_tracker: HashMap::new(),
             image_build_progress: HashMap::new(),
+            network_manager: None,
+            container_networks: HashMap::new(),
         })
     }
 
@@ -140,6 +152,18 @@ impl JailManager {
         // Initialize database with new tables
         let store = JailStore::new(&config.storage.database_path)?;
 
+        // Create and initialize network manager
+        let mut network_manager = NetworkManager::new();
+        #[cfg(target_os = "freebsd")]
+        {
+            if let Err(e) = network_manager.initialize() {
+                warn!("Failed to initialize network manager: {}. Container networking will not be available.", e);
+                // Continue without networking - container creation will work but without network
+            } else {
+                info!("Network manager initialized successfully");
+            }
+        }
+
         Ok(Self {
             socket_path: PathBuf::from(&config.storage.socket_path),
             jails: HashMap::new(),
@@ -153,6 +177,8 @@ impl JailManager {
             config,
             image_build_tracker: HashMap::new(),
             image_build_progress: HashMap::new(),
+            network_manager: Some(network_manager),
+            container_networks: HashMap::new(),
         })
     }
 
@@ -705,6 +731,25 @@ impl JailManager {
                 .map_err(|e| StoreError::SerializationError(format!("Failed to mount container dataset: {}", e)))?;
         }
 
+        // Allocate network resources if network manager is available
+        let container_ip = if let Some(ref mut network_manager) = self.network_manager {
+            match network_manager.allocate_network(&jail_name) {
+                Ok(network) => {
+                    let ip = network.ip.clone();
+                    self.container_networks.insert(container_id.clone(), network);
+                    info!("Allocated IP {} for container {}", ip, container_id);
+                    Some(ip)
+                }
+                Err(e) => {
+                    warn!("Failed to allocate network for container {}: {}. Container will have no networking.", container_id, e);
+                    None
+                }
+            }
+        } else {
+            info!("No network manager available, container {} will have no networking", container_id);
+            None
+        };
+
         // Create the FreeBSD jail with the mounted path
         let jail = crate::jail::Jail::create(&jail_name)
             .and_then(|j| j.with_path(&container_mountpoint))
@@ -717,6 +762,16 @@ impl JailManager {
         let mut container = Container::new_with_id(container_id.clone(), config.image_id.clone(), jail_name, dataset)
             .with_name(config.name.unwrap_or_else(|| container_id.clone()))
             .with_restart_policy(config.restart_policy);
+
+        // Set IP if allocated
+        if let Some(ref ip) = container_ip {
+            container = container.with_ip(ip.clone());
+        }
+
+        // Add port mappings
+        for port_mapping in &config.ports {
+            container = container.with_port_mapping(port_mapping.clone());
+        }
 
         // Store in database
         if let Some(ref store) = self.store {
@@ -775,15 +830,48 @@ impl JailManager {
         }
 
         // Clone the data we need before starting the jail
-        let (jail_name, command) = {
+        let (jail_name, command, port_mappings, ip) = {
             let container = self.containers.get(id)
                 .ok_or_else(|| StoreError::SerializationError(format!("Container {} not found", id)))?;
-            (container.jail_name.clone(), container.command.clone())
+            (
+                container.jail_name.clone(),
+                container.command.clone(),
+                container.port_mappings.clone(),
+                container.ip.clone(),
+            )
         };
 
         // Start the jail
         self.start_jail(&jail_name)
             .map_err(|e| StoreError::SerializationError(e.to_string()))?;
+
+        // Configure network if we have a network configuration for this container
+        if let Some(ref network_manager) = self.network_manager {
+            if let Some(network) = self.container_networks.get(id) {
+                info!("Configuring network for container {}", id);
+                if let Err(e) = network_manager.configure_jail_network(&jail_name, network) {
+                    warn!("Failed to configure network for container {}: {}", id, e);
+                }
+            }
+        }
+
+        // Set up port forwarding if we have port mappings
+        if let Some(ref network_manager) = self.network_manager {
+            for port_mapping in &port_mappings {
+                if let Some(ref container_ip) = ip {
+                    info!("Setting up port forwarding for container {}: {} -> {}:{} ({})",
+                          id, port_mapping.host_port, container_ip, port_mapping.container_port, port_mapping.protocol);
+                    if let Err(e) = network_manager.setup_port_forwarding(
+                        container_ip,
+                        port_mapping.host_port,
+                        port_mapping.container_port,
+                        port_mapping.protocol.as_str(),
+                    ) {
+                        warn!("Failed to set up port forwarding for container {}: {}", id, e);
+                    }
+                }
+            }
+        }
 
         // Execute command if specified
         if let Some(cmd) = command {
@@ -859,6 +947,24 @@ impl JailManager {
     pub fn remove_container(&mut self, id: &ContainerId) -> Result<(), StoreError> {
         let container = self.containers.remove(id)
             .ok_or_else(|| StoreError::SerializationError(format!("Container {} not found", id)))?;
+
+        // Release network resources if we have a network configuration
+        if let Some(ref mut network_manager) = self.network_manager {
+            if let Some(network) = self.container_networks.remove(id) {
+                info!("Releasing network resources for container {}", id);
+                if let Err(e) = network_manager.release_network(&network) {
+                    warn!("Failed to release network for container {}: {}", id, e);
+                }
+            }
+        }
+
+        // Remove port forwarding if configured
+        if let Some(ref network_manager) = self.network_manager {
+            if let Some(ref ip) = container.ip {
+                info!("Removing port forwarding for container {}", id);
+                let _ = network_manager.remove_port_forwarding(ip);
+            }
+        }
 
         // Stop if running
         if container.is_running() {

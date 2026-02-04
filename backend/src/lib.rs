@@ -128,6 +128,15 @@ impl JailManager {
     pub fn with_config(config: KawakazeConfig) -> Result<Self, StoreError> {
         let zfs = Zfs::new(&config.zfs_pool).ok();
 
+        // Ensure required ZFS datasets exist
+        if let Some(ref zfs) = zfs {
+            // Create containers dataset if it doesn't exist (ignoring errors if it already exists)
+            let containers_dataset = format!("{}/containers", config.zfs_pool);
+            if !zfs.dataset_exists(&containers_dataset) {
+                let _ = zfs.create_dataset(&containers_dataset);
+            }
+        }
+
         // Initialize database with new tables
         let store = JailStore::new(&config.storage.database_path)?;
 
@@ -621,6 +630,25 @@ impl JailManager {
         })
     }
 
+    /// Get an image by ID prefix (supports short IDs like "6f5d541c-5cc")
+    /// Returns the first image whose ID starts with the given prefix.
+    /// Returns None if multiple images match the prefix (ambiguous).
+    pub fn get_image_by_prefix(&self, prefix: &str) -> Option<&Image> {
+        let matches: Vec<&Image> = self.images.values()
+            .filter(|i| i.id.starts_with(prefix))
+            .collect();
+
+        match matches.len() {
+            0 => None,
+            1 => Some(matches[0]),
+            _ => {
+                // Multiple matches - ambiguous
+                warn!("Ambiguous image prefix '{}': matches {} images", prefix, matches.len());
+                None
+            }
+        }
+    }
+
     /// List all images
     pub fn list_images(&self) -> Vec<&Image> {
         let mut images: Vec<&Image> = self.images.values().collect();
@@ -672,8 +700,17 @@ impl JailManager {
             zfs.clone_snapshot(&image.snapshot, &dataset)?;
         }
 
-        // Create container
-        let container = Container::new(config.image_id.clone(), jail_name, dataset)
+        // Create the FreeBSD jail
+        let mount_point = format!("/{}", dataset.replace('/', "_"));
+        let jail = crate::jail::Jail::create(&jail_name)
+            .and_then(|j| j.with_path(&mount_point))
+            .map_err(|e| StoreError::SerializationError(format!("Failed to create jail: {}", e)))?;
+
+        // Add to jails HashMap
+        self.jails.insert(jail_name.clone(), jail);
+
+        // Create container with the pre-generated ID
+        let container = Container::new_with_id(container_id.clone(), config.image_id.clone(), jail_name, dataset)
             .with_name(config.name.unwrap_or_else(|| container_id.clone()))
             .with_restart_policy(config.restart_policy);
 
@@ -704,6 +741,22 @@ impl JailManager {
 
     /// Start a container
     pub fn start_container(&mut self, id: &ContainerId) -> Result<(), StoreError> {
+        // Try to load from database if not in memory
+        if !self.containers.contains_key(id) {
+            if let Some(ref store) = self.store {
+                if let Ok(Some(store_container)) = store.get_container(id) {
+                    match self.load_container_from_store_row(store_container) {
+                        Ok(container) => {
+                            self.containers.insert(id.clone(), container);
+                        }
+                        Err(e) => {
+                            return Err(StoreError::SerializationError(format!("Failed to load container: {}", e)));
+                        }
+                    }
+                }
+            }
+        }
+
         // Get the jail name first
         let jail_name = self.containers.get(id)
             .ok_or_else(|| StoreError::SerializationError(format!("Container {} not found", id)))?
@@ -728,6 +781,22 @@ impl JailManager {
 
     /// Stop a container
     pub fn stop_container(&mut self, id: &ContainerId) -> Result<(), StoreError> {
+        // Try to load from database if not in memory
+        if !self.containers.contains_key(id) {
+            if let Some(ref store) = self.store {
+                if let Ok(Some(store_container)) = store.get_container(id) {
+                    match self.load_container_from_store_row(store_container) {
+                        Ok(container) => {
+                            self.containers.insert(id.clone(), container);
+                        }
+                        Err(e) => {
+                            return Err(StoreError::SerializationError(format!("Failed to load container: {}", e)));
+                        }
+                    }
+                }
+            }
+        }
+
         // Get the jail name first
         let jail_name = self.containers.get(id)
             .ok_or_else(|| StoreError::SerializationError(format!("Container {} not found", id)))?
@@ -788,6 +857,25 @@ impl JailManager {
             }
             None
         })
+    }
+
+    /// Get a container by ID prefix (supports short IDs like "faeb9f1b-b05")
+    /// Returns the first container whose ID starts with the given prefix.
+    /// Returns None if multiple containers match the prefix (ambiguous).
+    pub fn get_container_by_prefix(&self, prefix: &str) -> Option<&Container> {
+        let matches: Vec<&Container> = self.containers.values()
+            .filter(|c| c.id.starts_with(prefix))
+            .collect();
+
+        match matches.len() {
+            0 => None,
+            1 => Some(matches[0]),
+            _ => {
+                // Multiple matches - ambiguous
+                warn!("Ambiguous container prefix '{}': matches {} containers", prefix, matches.len());
+                None
+            }
+        }
     }
 
     /// List all containers

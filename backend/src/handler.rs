@@ -382,9 +382,11 @@ async fn list_images(manager: Arc<Mutex<JailManager>>) -> Response {
 async fn get_image(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Response {
     let mgr = manager.lock().await;
 
-    // Try ID first, then name
+    // Try ID first, then name, then prefix
     let id_or_name_string = id_or_name.to_string();
-    let image = mgr.get_image(&id_or_name_string).or_else(|| mgr.get_image_by_name(id_or_name));
+    let image = mgr.get_image(&id_or_name_string)
+        .or_else(|| mgr.get_image_by_name(id_or_name))
+        .or_else(|| mgr.get_image_by_prefix(id_or_name));
 
     match image {
         Some(image) => {
@@ -606,11 +608,13 @@ async fn build_image(manager: Arc<Mutex<JailManager>>, request: BuildImageReques
 async fn delete_image(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Response {
     let mut mgr = manager.lock().await;
 
-    // Try to find the image
+    // Try to find the image (exact ID, name, or prefix)
     let id_or_name_string = id_or_name.to_string();
     let image_id = if let Some(image) = mgr.get_image(&id_or_name_string) {
         image.id.clone()
     } else if let Some(image) = mgr.get_image_by_name(id_or_name) {
+        image.id.clone()
+    } else if let Some(image) = mgr.get_image_by_prefix(id_or_name) {
         image.id.clone()
     } else {
         return Response::not_found(format!("Image '{}'", id_or_name));
@@ -631,9 +635,11 @@ async fn delete_image(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Res
 async fn get_image_history(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Response {
     let mgr = manager.lock().await;
 
-    // Try to find the image
+    // Try to find the image (exact ID, name, or prefix)
     let id_or_name_string = id_or_name.to_string();
-    let image = mgr.get_image(&id_or_name_string).or_else(|| mgr.get_image_by_name(id_or_name));
+    let image = mgr.get_image(&id_or_name_string)
+        .or_else(|| mgr.get_image_by_name(id_or_name))
+        .or_else(|| mgr.get_image_by_prefix(id_or_name));
 
     match image {
         Some(img) => {
@@ -750,17 +756,19 @@ async fn list_containers(manager: Arc<Mutex<JailManager>>) -> Response {
     }
 }
 
-/// Get container by ID or name
+/// Get container by ID, name, or prefix
 async fn get_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Response {
     let mgr = manager.lock().await;
 
-    // Try ID first, then search by name
+    // Try ID first, then prefix, then search by name
     let id_or_name_string = id_or_name.to_string();
-    let container = mgr.get_container(&id_or_name_string).or_else(|| {
-        mgr.list_containers()
-            .into_iter()
-            .find(|c| c.name.as_deref() == Some(id_or_name))
-    });
+    let container = mgr.get_container(&id_or_name_string)
+        .or_else(|| mgr.get_container_by_prefix(id_or_name))
+        .or_else(|| {
+            mgr.list_containers()
+                .into_iter()
+                .find(|c| c.name.as_deref() == Some(id_or_name))
+        });
 
     match container {
         Some(container) => {
@@ -787,9 +795,10 @@ async fn get_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Re
 async fn create_container(manager: Arc<Mutex<JailManager>>, request: CreateContainerRequest) -> Response {
     let mut mgr = manager.lock().await;
 
-    // Validate image exists
+    // Validate image exists (try exact ID, then name, then prefix)
     let image = mgr.get_image(&request.image_id)
-        .or_else(|| mgr.get_image_by_name(&request.image_id));
+        .or_else(|| mgr.get_image_by_name(&request.image_id))
+        .or_else(|| mgr.get_image_by_prefix(&request.image_id));
 
     if image.is_none() {
         return Response::not_found(format!("Image '{}'", request.image_id));
@@ -829,9 +838,9 @@ async fn create_container(manager: Arc<Mutex<JailManager>>, request: CreateConta
         })
         .collect();
 
-    // Create container config
+    // Create container config - use the resolved full image ID
     let config = crate::container::ContainerConfig {
-        image_id: request.image_id.clone(),
+        image_id: image.unwrap().id.clone(),
         name: request.name.clone(),
         ports: port_mappings,
         volumes: mounts,
@@ -863,10 +872,12 @@ async fn create_container(manager: Arc<Mutex<JailManager>>, request: CreateConta
 async fn start_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Response {
     let mut mgr = manager.lock().await;
 
-    // Find container by ID or name
+    // Find container by ID, name, or prefix
     let id_or_name_string = id_or_name.to_string();
-    let container_id = if let Some(_) = mgr.get_container(&id_or_name_string) {
-        id_or_name_string
+    let container_id = if let Some(c) = mgr.get_container(&id_or_name_string) {
+        c.id.clone()
+    } else if let Some(c) = mgr.get_container_by_prefix(id_or_name) {
+        c.id.clone()
     } else {
         match mgr.list_containers()
             .into_iter()
@@ -903,10 +914,12 @@ async fn start_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> 
 async fn stop_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Response {
     let mut mgr = manager.lock().await;
 
-    // Find container by ID or name
+    // Find container by ID, name, or prefix
     let id_or_name_string = id_or_name.to_string();
-    let container_id = if let Some(_) = mgr.get_container(&id_or_name_string) {
-        id_or_name_string
+    let container_id = if let Some(c) = mgr.get_container(&id_or_name_string) {
+        c.id.clone()
+    } else if let Some(c) = mgr.get_container_by_prefix(id_or_name) {
+        c.id.clone()
     } else {
         match mgr.list_containers()
             .into_iter()
@@ -943,10 +956,12 @@ async fn stop_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> R
 async fn remove_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str, force: bool) -> Response {
     let mut mgr = manager.lock().await;
 
-    // Find container by ID or name
+    // Find container by ID, name, or prefix
     let id_or_name_string = id_or_name.to_string();
-    let container_id = if let Some(_) = mgr.get_container(&id_or_name_string) {
-        id_or_name_string
+    let container_id = if let Some(c) = mgr.get_container(&id_or_name_string) {
+        c.id.clone()
+    } else if let Some(c) = mgr.get_container_by_prefix(id_or_name) {
+        c.id.clone()
     } else {
         match mgr.list_containers()
             .into_iter()

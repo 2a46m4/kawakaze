@@ -278,6 +278,25 @@ impl Container {
         }
     }
 
+    /// Creates a new container with a specific ID
+    /// Use this when you want to control the container ID (e.g., when generating it beforehand)
+    pub fn new_with_id(id: ContainerId, image_id: String, jail_name: String, dataset: String) -> Self {
+        Container {
+            id,
+            name: None,
+            image_id,
+            jail_name,
+            dataset,
+            state: ContainerState::Created,
+            restart_policy: RestartPolicy::default(),
+            mounts: Vec::new(),
+            port_mappings: Vec::new(),
+            ip: None,
+            created_at: chrono::Utc::now().timestamp(),
+            started_at: None,
+        }
+    }
+
     /// Creates a container from existing data (e.g., loaded from database)
     pub fn new_with_existing_data(
         id: ContainerId,

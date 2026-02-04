@@ -1,76 +1,18 @@
 //! Unix socket server for Kawakaze API
 //!
-//! This module provides a JSON-over-Unix-socket server using length-prefixed framing.
+//! This module provides a JSON-over-Unix-socket server using line-delimited framing.
 
 use std::path::Path;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::sync::Mutex;
-use tokio_util::codec::{Decoder, Encoder, Framed};
+use tokio_util::codec::{Framed, LinesCodec};
 use futures::{SinkExt, StreamExt};
-use bytes::Buf;
 use tracing::{info, warn, error, debug, instrument};
 
 use crate::api::Request;
 use crate::handler::handle_request;
 use crate::JailManager;
-
-/// JSON codec for length-prefixed JSON messages
-///
-/// Message format: 4-byte big-endian length prefix + JSON payload
-#[derive(Debug, Clone)]
-pub struct JsonCodec;
-
-impl Decoder for JsonCodec {
-    type Item = serde_json::Value;
-    type Error = std::io::Error;
-
-    fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        // Need at least 4 bytes for length prefix
-        if src.len() < 4 {
-            return Ok(None);
-        }
-
-        // Read length prefix (big-endian u32)
-        let mut len_bytes = [0u8; 4];
-        len_bytes.copy_from_slice(&src[0..4]);
-        let len = u32::from_be_bytes(len_bytes) as usize;
-
-        // Check if we have the full message
-        if src.len() < 4 + len {
-            return Ok(None);
-        }
-
-        // Remove length prefix and JSON payload from buffer
-        src.advance(4);
-
-        // Parse JSON payload
-        let json_data = src.split_to(len);
-        let value = serde_json::from_slice(&json_data)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        Ok(Some(value))
-    }
-}
-
-impl Encoder<serde_json::Value> for JsonCodec {
-    type Error = std::io::Error;
-
-    fn encode(&mut self, item: serde_json::Value, dst: &mut bytes::BytesMut) -> Result<(), Self::Error> {
-        // Serialize JSON to bytes
-        let json_bytes = serde_json::to_vec(&item)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-        // Write length prefix (big-endian u32)
-        let len = json_bytes.len() as u32;
-        dst.extend_from_slice(&len.to_be_bytes());
-
-        // Write JSON payload
-        dst.extend_from_slice(&json_bytes);
-
-        Ok(())
-    }
-}
 
 /// Unix socket server for the Kawakaze API
 pub struct SocketServer {
@@ -147,23 +89,23 @@ impl SocketServer {
 /// Handle a single client connection
 #[instrument(skip(stream, manager), fields(connection_id = connection_id))]
 async fn handle_connection(
-    mut stream: tokio::net::UnixStream,
+    stream: tokio::net::UnixStream,
     manager: Arc<Mutex<JailManager>>,
     connection_id: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Use Framed with our JsonCodec for length-prefixed messages
-    let mut framed = Framed::new(&mut stream, JsonCodec);
+    // Use Framed with LinesCodec for line-delimited JSON messages
+    let mut framed = Framed::new(stream, LinesCodec::new());
 
     let mut request_count: u64 = 0;
 
     loop {
-        // Read next JSON message
+        // Read next JSON line
         match framed.next().await {
-            Some(Ok(json_value)) => {
+            Some(Ok(line)) => {
                 request_count += 1;
 
                 // Parse JSON as Request
-                let request = match serde_json::from_value::<Request>(json_value) {
+                let request = match serde_json::from_str::<Request>(&line) {
                     Ok(req) => req,
                     Err(e) => {
                         warn!(request_id = request_count, error = %e, "Invalid request format");
@@ -175,7 +117,9 @@ async fn handle_connection(
                                 "message": format!("Invalid request format: {}", e)
                             }
                         });
-                        framed.send(error_response).await?;
+                        let response_line = serde_json::to_string(&error_response)
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+                        framed.send(response_line).await?;
                         continue;
                     }
                 };
@@ -207,8 +151,8 @@ async fn handle_connection(
                     );
                 }
 
-                // Serialize response to JSON
-                let response_json = match serde_json::to_value(&response) {
+                // Serialize response to JSON string
+                let response_line = match serde_json::to_string(&response) {
                     Ok(json) => json,
                     Err(e) => {
                         error!(request_id = request_count, error = %e, "Failed to serialize response");
@@ -220,15 +164,24 @@ async fn handle_connection(
                                 "message": format!("Failed to serialize response: {}", e)
                             }
                         });
-                        framed.send(error_json).await?;
-                        continue;
+                        serde_json::to_string(&error_json)
+                            .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?
                     }
                 };
 
                 // Send response
-                framed.send(response_json).await?;
+                framed.send(response_line).await?;
+
+                // For simple request/response model, close connection after one request
+                break;
             }
             Some(Err(e)) => {
+                // If we've already handled at least one request, the client might have
+                // simply closed the connection after receiving the response
+                if request_count > 0 {
+                    debug!(connection_id = connection_id, "Client closed connection after request");
+                    break;
+                }
                 error!(connection_id = connection_id, error = %e, "Frame decode error");
                 return Err(Box::new(e) as Box<dyn std::error::Error>);
             }
@@ -246,96 +199,11 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::BytesMut;
 
     #[test]
-    fn test_json_codec_encode() {
-        let mut codec = JsonCodec;
-        let mut dst = BytesMut::new();
-
-        let json_value = serde_json::json!({"test": "data"});
-        codec.encode(json_value.clone(), &mut dst).unwrap();
-
-        // Should have 4-byte length prefix + JSON payload
-        assert!(dst.len() > 4);
-
-        // Verify length prefix
-        let len_bytes = [dst[0], dst[1], dst[2], dst[3]];
-        let len = u32::from_be_bytes(len_bytes) as usize;
-        assert_eq!(len, dst.len() - 4);
-    }
-
-    #[test]
-    fn test_json_codec_decode() {
-        let mut codec = JsonCodec;
-        let mut dst = BytesMut::new();
-
-        let json_value = serde_json::json!({"test": "data"});
-        codec.encode(json_value.clone(), &mut dst).unwrap();
-
-        // Decode the message
-        let decoded = codec.decode(&mut dst).unwrap().unwrap();
-        assert_eq!(decoded, json_value);
-
-        // Buffer should be empty after decoding
-        assert!(dst.is_empty());
-    }
-
-    #[test]
-    fn test_json_codec_partial_message() {
-        let mut codec = JsonCodec;
-        let mut dst = BytesMut::new();
-
-        let json_value = serde_json::json!({"test": "data"});
-        codec.encode(json_value, &mut dst).unwrap();
-
-        // Take only part of the message
-        let partial_len = dst.len() / 2;
-        let mut partial = BytesMut::from(&dst[..partial_len]);
-        dst.advance(partial_len);
-
-        // Should return None for partial message
-        assert!(codec.decode(&mut partial).unwrap().is_none());
-
-        // Decode with the rest of the message
-        partial.unsplit(dst);
-        let decoded = codec.decode(&mut partial).unwrap().unwrap();
-        assert!(decoded.is_object());
-    }
-
-    #[test]
-    fn test_json_codec_empty_buffer() {
-        let mut codec = JsonCodec;
-        let mut dst = BytesMut::new();
-
-        // Should return None for empty buffer
-        assert!(codec.decode(&mut dst).unwrap().is_none());
-    }
-
-    #[test]
-    fn test_json_codec_multiple_messages() {
-        let mut codec = JsonCodec;
-        let mut dst = BytesMut::new();
-
-        // Encode multiple messages
-        let msg1 = serde_json::json!({"msg": 1});
-        let msg2 = serde_json::json!({"msg": 2});
-        let msg3 = serde_json::json!({"msg": 3});
-
-        codec.encode(msg1.clone(), &mut dst).unwrap();
-        codec.encode(msg2.clone(), &mut dst).unwrap();
-        codec.encode(msg3.clone(), &mut dst).unwrap();
-
-        // Decode all messages
-        let decoded1 = codec.decode(&mut dst).unwrap().unwrap();
-        let decoded2 = codec.decode(&mut dst).unwrap().unwrap();
-        let decoded3 = codec.decode(&mut dst).unwrap().unwrap();
-
-        assert_eq!(decoded1, msg1);
-        assert_eq!(decoded2, msg2);
-        assert_eq!(decoded3, msg3);
-
-        // Buffer should be empty
-        assert!(codec.decode(&mut dst).unwrap().is_none());
+    fn test_socket_server_creation() {
+        let manager = Arc::new(Mutex::new(JailManager::new("/tmp/test.sock")));
+        let server = SocketServer::new(Arc::new("/tmp/test.sock".to_string()), manager);
+        assert_eq!(server.socket_path.as_ref(), "/tmp/test.sock");
     }
 }

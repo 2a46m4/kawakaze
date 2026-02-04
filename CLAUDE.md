@@ -2,17 +2,46 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-Use subagents for distinct phases.
+Use subagents for distinct phases. It is important to write unit and integration tests for all the code that you write.
 
 ## Project Overview
 
 Kawakaze is a jail manager for FreeBSD. The user interacts with Kawakaze using a CLI tool. 
 
+### Concepts
+
+There is a concept of Images and Containers.
+
+#### Images
+Images are blueprints of containers that can be produced by committing changes to a container, or by being created from a Dockerfile, which specifies the steps required to produce the image. Images can be created from other images, by using the FROM keyword in the Dockerfile. 
+
+For now, a local image repository is all that is needed.
+
+Implementation wise, the best way to implement this is to use ZFS snapshots.
+
+#### Containers
+Containers are instantiations of images. These exist as running jails. Their lifetime should be managed by the backend, with distinct restart policies (on-restart, on-fail, noop)
+
+Implementation wise they can be promoted clones of a ZFS snapshot (thick jails) or regular clones. For ease of implementation, only thick jails should be considered for now.
+
+The user should also be able to mount ZFS datasets or regular filepaths via nullfs. 
+
+The containers should have an IP space of 10.11.0.0/16. Every container should be allocated an epair to connect to the internet. The pf should perform NAT on a bridge device. 
+
+The container should be allowed to expose ports that can be redirected.
+
 ### CLI
-The CLI can create, destroy, and manage jails. It is able to parse Dockerfiles and create containers that way. 
+The CLI can create, destroy, and manage jails. 
+
+The user should be able to:
+- Build images from Dockerfiles
+- Instantiate containers
+- Start and stop containers
+
+The UI should be similar to Podman or Docker. A unique UUID should be generated for every container, along with a name and the image that it is running.
 
 ### Backend
-The backend is the section that actually manages the jails. It communicates with clients through a unix socket. It should interface with the libjail library.
+The backend is the section that actually manages the jails. It communicates with clients through a unix socket. It should interface with the libjail library. The majority of the work should be done here, with the CLI being a relatively thin wrapper over the API.
 
 ## Workspace Structure
 

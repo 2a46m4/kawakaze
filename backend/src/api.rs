@@ -5,6 +5,7 @@
 
 use crate::jail::{JailError, JailState};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// HTTP-like methods for API requests
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -34,6 +35,38 @@ pub enum Endpoint {
     BootstrapJail(String),
     /// Get bootstrap status: GET /jails/{name}/bootstrap/status
     BootstrapStatus(String),
+
+    // Image endpoints
+
+    /// List all images: GET /images
+    Images,
+    /// Get specific image: GET /images/{id}
+    Image(String),
+    /// Build image from Dockerfile: POST /images/build
+    ImageBuild,
+    /// Delete an image: DELETE /images/{id}
+    DeleteImage(String),
+    /// Get image history: GET /images/{id}/history
+    ImageHistory(String),
+
+    // Container endpoints
+
+    /// List all containers: GET /containers
+    Containers,
+    /// Get specific container: GET /containers/{id}
+    Container(String),
+    /// Create container: POST /containers/create
+    ContainerCreate,
+    /// Start container: POST /containers/{id}/start
+    StartContainer(String),
+    /// Stop container: POST /containers/{id}/stop
+    StopContainer(String),
+    /// Remove container: DELETE /containers/{id}
+    RemoveContainer(String),
+    /// Get container logs: GET /containers/{id}/logs
+    ContainerLogs(String),
+    /// Execute command in container: POST /containers/{id}/exec
+    ContainerExec(String),
 }
 
 impl Endpoint {
@@ -46,6 +79,21 @@ impl Endpoint {
             Endpoint::StopJail(name) => format!("jails/{}/stop", name),
             Endpoint::BootstrapJail(name) => format!("jails/{}/bootstrap", name),
             Endpoint::BootstrapStatus(name) => format!("jails/{}/bootstrap/status", name),
+
+            Endpoint::Images => "images".to_string(),
+            Endpoint::Image(id) => format!("images/{}", id),
+            Endpoint::ImageBuild => "images/build".to_string(),
+            Endpoint::DeleteImage(id) => format!("images/{}", id),
+            Endpoint::ImageHistory(id) => format!("images/{}/history", id),
+
+            Endpoint::Containers => "containers".to_string(),
+            Endpoint::Container(id) => format!("containers/{}", id),
+            Endpoint::ContainerCreate => "containers/create".to_string(),
+            Endpoint::StartContainer(id) => format!("containers/{}/start", id),
+            Endpoint::StopContainer(id) => format!("containers/{}/stop", id),
+            Endpoint::RemoveContainer(id) => format!("containers/{}", id),
+            Endpoint::ContainerLogs(id) => format!("containers/{}/logs", id),
+            Endpoint::ContainerExec(id) => format!("containers/{}/exec", id),
         }
     }
 }
@@ -120,6 +168,24 @@ impl Request {
             ["jails", name, "stop"] => Ok(Endpoint::StopJail(name.to_string())),
             ["jails", name, "bootstrap"] => Ok(Endpoint::BootstrapJail(name.to_string())),
             ["jails", name, "bootstrap", "status"] => Ok(Endpoint::BootstrapStatus(name.to_string())),
+
+            ["images"] => Ok(Endpoint::Images),
+            ["images", "build"] => Ok(Endpoint::ImageBuild),
+            ["images", id] if self.method == Method::Get || self.method == Method::Delete => {
+                Ok(Endpoint::Image(id.to_string()))
+            }
+            ["images", id, "history"] => Ok(Endpoint::ImageHistory(id.to_string())),
+
+            ["containers"] => Ok(Endpoint::Containers),
+            ["containers", "create"] => Ok(Endpoint::ContainerCreate),
+            ["containers", id] if self.method == Method::Get || self.method == Method::Delete => {
+                Ok(Endpoint::Container(id.to_string()))
+            }
+            ["containers", id, "start"] => Ok(Endpoint::StartContainer(id.to_string())),
+            ["containers", id, "stop"] => Ok(Endpoint::StopContainer(id.to_string())),
+            ["containers", id, "logs"] => Ok(Endpoint::ContainerLogs(id.to_string())),
+            ["containers", id, "exec"] => Ok(Endpoint::ContainerExec(id.to_string())),
+
             _ => Err(ApiError::BadRequest(format!("Unknown endpoint: {}", self.endpoint))),
         }
     }
@@ -417,6 +483,191 @@ impl From<(String, JailState)> for JailListItem {
     }
 }
 
+// ============================================================================
+// Image and Container Types
+// ============================================================================
+
+/// Placeholder for port mapping (to be implemented in container.rs)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PortMapping {
+    pub host_port: u16,
+    pub container_port: u16,
+    pub protocol: String, // "tcp" or "udp"
+}
+
+/// Placeholder for volume mount (to be implemented in container.rs)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Mount {
+    pub source: String,
+    pub destination: String,
+    pub mount_type: String, // "zfs" or "nullfs"
+}
+
+// ----------------------------------------------------------------------------
+// Image Request Types
+// ----------------------------------------------------------------------------
+
+/// Request body for building an image from a Dockerfile
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BuildImageRequest {
+    /// Image name
+    pub name: String,
+    /// Dockerfile content
+    pub dockerfile: String,
+    /// Build arguments for Dockerfile ARG instructions
+    #[serde(default)]
+    pub build_args: HashMap<String, String>,
+}
+
+// ----------------------------------------------------------------------------
+// Container Request Types
+// ----------------------------------------------------------------------------
+
+/// Request body for creating a container
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CreateContainerRequest {
+    /// Image ID to instantiate
+    pub image_id: String,
+    /// Optional container name
+    pub name: Option<String>,
+    /// Port mappings from host to container
+    #[serde(default)]
+    pub ports: Vec<PortMapping>,
+    /// Volume mounts (ZFS datasets or nullfs filepaths)
+    #[serde(default)]
+    pub volumes: Vec<Mount>,
+    /// Environment variables
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Restart policy ("on-restart", "on-fail", "noop")
+    #[serde(default)]
+    pub restart_policy: String,
+    /// Optional command to run (overrides image default)
+    pub command: Option<Vec<String>>,
+}
+
+/// Request body for executing a command in a container
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExecRequest {
+    /// Command and arguments to execute
+    pub command: Vec<String>,
+    /// Environment variables for the command
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Optional working directory
+    #[serde(default)]
+    pub workdir: Option<String>,
+}
+
+// ----------------------------------------------------------------------------
+// Image Response Types
+// ----------------------------------------------------------------------------
+
+/// Detailed information about an image
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImageInfo {
+    /// Unique image identifier (UUID)
+    pub id: String,
+    /// Image name
+    pub name: String,
+    /// Parent image ID (if built from another image)
+    pub parent_id: Option<String>,
+    /// Size in bytes
+    pub size_bytes: u64,
+    /// Image state
+    pub state: String,
+    /// Unix timestamp of creation
+    pub created_at: i64,
+}
+
+/// Item in image list response
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImageListItem {
+    /// Unique image identifier (UUID)
+    pub id: String,
+    /// Image name
+    pub name: String,
+    /// Size in bytes
+    pub size_bytes: u64,
+    /// Unix timestamp of creation
+    pub created_at: i64,
+}
+
+/// Historical layer information for an image
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ImageHistoryItem {
+    /// Layer ID
+    pub id: String,
+    /// Created timestamp
+    pub created_at: i64,
+    /// Size in bytes
+    pub size_bytes: u64,
+    /// Description/command that created this layer
+    pub created_by: String,
+}
+
+// ----------------------------------------------------------------------------
+// Container Response Types
+// ----------------------------------------------------------------------------
+
+/// Detailed information about a container
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContainerInfo {
+    /// Unique container identifier (UUID)
+    pub id: String,
+    /// Container name (if set)
+    pub name: Option<String>,
+    /// Image ID the container is running
+    pub image_id: String,
+    /// Container state
+    pub state: String,
+    /// Container IP address (if running)
+    pub ip: Option<String>,
+    /// Restart policy
+    pub restart_policy: String,
+    /// Unix timestamp of creation
+    pub created_at: i64,
+    /// Unix timestamp when last started
+    pub started_at: Option<i64>,
+}
+
+/// Item in container list response
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContainerListItem {
+    /// Unique container identifier (UUID)
+    pub id: String,
+    /// Container name (if set)
+    pub name: Option<String>,
+    /// Image ID the container is running
+    pub image_id: String,
+    /// Container state
+    pub state: String,
+    /// Container IP address (if running)
+    pub ip: Option<String>,
+}
+
+/// Container log entry
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContainerLogEntry {
+    /// Unix timestamp
+    pub timestamp: i64,
+    /// Log level ("info", "warn", "error", "debug")
+    pub level: String,
+    /// Log message
+    pub message: String,
+}
+
+/// Result of executing a command in a container
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExecResult {
+    /// Exit code
+    pub exit_code: i32,
+    /// Standard output
+    pub stdout: String,
+    /// Standard error
+    pub stderr: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,6 +678,23 @@ mod tests {
         assert_eq!(Endpoint::Jail("test".into()).path(), "jails/test");
         assert_eq!(Endpoint::StartJail("test".into()).path(), "jails/test/start");
         assert_eq!(Endpoint::StopJail("test".into()).path(), "jails/test/stop");
+
+        // Image endpoints
+        assert_eq!(Endpoint::Images.path(), "images");
+        assert_eq!(Endpoint::Image("abc123".into()).path(), "images/abc123");
+        assert_eq!(Endpoint::ImageBuild.path(), "images/build");
+        assert_eq!(Endpoint::DeleteImage("abc123".into()).path(), "images/abc123");
+        assert_eq!(Endpoint::ImageHistory("abc123".into()).path(), "images/abc123/history");
+
+        // Container endpoints
+        assert_eq!(Endpoint::Containers.path(), "containers");
+        assert_eq!(Endpoint::Container("def456".into()).path(), "containers/def456");
+        assert_eq!(Endpoint::ContainerCreate.path(), "containers/create");
+        assert_eq!(Endpoint::StartContainer("def456".into()).path(), "containers/def456/start");
+        assert_eq!(Endpoint::StopContainer("def456".into()).path(), "containers/def456/stop");
+        assert_eq!(Endpoint::RemoveContainer("def456".into()).path(), "containers/def456");
+        assert_eq!(Endpoint::ContainerLogs("def456".into()).path(), "containers/def456/logs");
+        assert_eq!(Endpoint::ContainerExec("def456".into()).path(), "containers/def456/exec");
     }
 
     #[test]
@@ -481,6 +749,56 @@ mod tests {
         assert_eq!(
             req.parse_endpoint().unwrap(),
             Endpoint::StartJail("test".into())
+        );
+
+        // Image endpoints
+        let req = Request {
+            method: Method::Get,
+            endpoint: "images".to_string(),
+            body: serde_json::Value::Null,
+        };
+        assert_eq!(req.parse_endpoint().unwrap(), Endpoint::Images);
+
+        let req = Request {
+            method: Method::Get,
+            endpoint: "images/abc123".to_string(),
+            body: serde_json::Value::Null,
+        };
+        assert_eq!(
+            req.parse_endpoint().unwrap(),
+            Endpoint::Image("abc123".into())
+        );
+
+        let req = Request {
+            method: Method::Post,
+            endpoint: "images/build".to_string(),
+            body: serde_json::Value::Null,
+        };
+        assert_eq!(req.parse_endpoint().unwrap(), Endpoint::ImageBuild);
+
+        // Container endpoints
+        let req = Request {
+            method: Method::Get,
+            endpoint: "containers".to_string(),
+            body: serde_json::Value::Null,
+        };
+        assert_eq!(req.parse_endpoint().unwrap(), Endpoint::Containers);
+
+        let req = Request {
+            method: Method::Post,
+            endpoint: "containers/create".to_string(),
+            body: serde_json::Value::Null,
+        };
+        assert_eq!(req.parse_endpoint().unwrap(), Endpoint::ContainerCreate);
+
+        let req = Request {
+            method: Method::Post,
+            endpoint: "containers/def456/start".to_string(),
+            body: serde_json::Value::Null,
+        };
+        assert_eq!(
+            req.parse_endpoint().unwrap(),
+            Endpoint::StartContainer("def456".into())
         );
     }
 
@@ -564,5 +882,100 @@ mod tests {
         let err = JailError::StopFailed("Jail 'missing' not found".into());
         let api_err = ApiError::from(err);
         assert_eq!(api_err.code, "NOT_FOUND");
+    }
+
+    #[test]
+    fn test_build_image_request() {
+        let mut build_args = HashMap::new();
+        build_args.insert("VERSION".to_string(), "1.0".to_string());
+
+        let req = BuildImageRequest {
+            name: "test-image".to_string(),
+            dockerfile: "FROM freebsd:15.0\nRUN pkg install -y nginx".to_string(),
+            build_args,
+        };
+
+        assert_eq!(req.name, "test-image");
+        assert_eq!(req.build_args.len(), 1);
+        assert_eq!(req.build_args.get("VERSION"), Some(&"1.0".to_string()));
+    }
+
+    #[test]
+    fn test_create_container_request() {
+        let req = CreateContainerRequest {
+            image_id: "abc123".to_string(),
+            name: Some("webserver".to_string()),
+            ports: vec![PortMapping {
+                host_port: 8080,
+                container_port: 80,
+                protocol: "tcp".to_string(),
+            }],
+            volumes: vec![Mount {
+                source: "/data".to_string(),
+                destination: "/mnt/data".to_string(),
+                mount_type: "nullfs".to_string(),
+            }],
+            env: {
+                let mut map = HashMap::new();
+                map.insert("DEBUG".to_string(), "true".to_string());
+                map
+            },
+            restart_policy: "on-fail".to_string(),
+            command: Some(vec!["nginx".to_string(), "-g".to_string(), "daemon off;".to_string()]),
+        };
+
+        assert_eq!(req.image_id, "abc123");
+        assert_eq!(req.name, Some("webserver".to_string()));
+        assert_eq!(req.ports.len(), 1);
+        assert_eq!(req.volumes.len(), 1);
+        assert_eq!(req.restart_policy, "on-fail");
+        assert!(req.command.is_some());
+    }
+
+    #[test]
+    fn test_exec_request() {
+        let req = ExecRequest {
+            command: vec!["ls".to_string(), "-la".to_string()],
+            env: HashMap::new(),
+            workdir: Some("/tmp".to_string()),
+        };
+
+        assert_eq!(req.command.len(), 2);
+        assert_eq!(req.workdir, Some("/tmp".to_string()));
+    }
+
+    #[test]
+    fn test_image_info() {
+        let info = ImageInfo {
+            id: "abc123".to_string(),
+            name: "test-image".to_string(),
+            parent_id: Some("def456".to_string()),
+            size_bytes: 500_000_000,
+            state: "ready".to_string(),
+            created_at: 1640000000,
+        };
+
+        assert_eq!(info.id, "abc123");
+        assert_eq!(info.size_bytes, 500_000_000);
+        assert!(info.parent_id.is_some());
+    }
+
+    #[test]
+    fn test_container_info() {
+        let info = ContainerInfo {
+            id: "container-1".to_string(),
+            name: Some("webserver".to_string()),
+            image_id: "abc123".to_string(),
+            state: "running".to_string(),
+            ip: Some("10.11.0.2".to_string()),
+            restart_policy: "on-restart".to_string(),
+            created_at: 1640000000,
+            started_at: Some(1640000100),
+        };
+
+        assert_eq!(info.id, "container-1");
+        assert_eq!(info.state, "running");
+        assert_eq!(info.ip, Some("10.11.0.2".to_string()));
+        assert!(info.started_at.is_some());
     }
 }

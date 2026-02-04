@@ -6,9 +6,14 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::api::{
-    ApiError, BootstrapRequest, CreateJailRequest, Endpoint, JailInfo, JailListItem, Request, Response,
+    ApiError, BootstrapRequest, BuildImageRequest, ContainerInfo, ContainerListItem, CreateContainerRequest,
+    CreateJailRequest, Endpoint, ImageHistoryItem, ImageInfo, ImageListItem,
+    JailInfo, JailListItem, Request, Response,
 };
 use crate::bootstrap::{Bootstrap, BootstrapConfig};
+use crate::container::RestartPolicy;
+use crate::image::Image;
+use crate::image_builder::ImageBuildProgress;
 use crate::JailManager;
 
 /// Handle an API request and return a response
@@ -24,6 +29,7 @@ pub async fn handle_request(
 
     // Route to appropriate handler based on endpoint and method
     match (&request.method, &endpoint) {
+        // Jail endpoints
         (crate::api::Method::Get, Endpoint::Jails) => list_jails(manager).await,
         (crate::api::Method::Get, Endpoint::Jail(name)) => get_jail(manager, name).await,
         (crate::api::Method::Get, Endpoint::BootstrapStatus(name)) => get_bootstrap_progress(manager, name).await,
@@ -42,6 +48,32 @@ pub async fn handle_request(
             }
         }
         (crate::api::Method::Delete, Endpoint::Jail(name)) => delete_jail(manager, name).await,
+
+        // Image endpoints
+        (crate::api::Method::Get, Endpoint::Images) => list_images(manager).await,
+        (crate::api::Method::Get, Endpoint::Image(id_or_name)) => get_image(manager, id_or_name).await,
+        (crate::api::Method::Post, Endpoint::ImageBuild) => {
+            match serde_json::from_value::<BuildImageRequest>(request.body) {
+                Ok(build_req) => build_image(manager, build_req).await,
+                Err(err) => Response::bad_request(format!("Invalid request body: {}", err)),
+            }
+        }
+        (crate::api::Method::Delete, Endpoint::DeleteImage(id_or_name)) => delete_image(manager, id_or_name).await,
+        (crate::api::Method::Get, Endpoint::ImageHistory(id_or_name)) => get_image_history(manager, id_or_name).await,
+
+        // Container endpoints
+        (crate::api::Method::Get, Endpoint::Containers) => list_containers(manager).await,
+        (crate::api::Method::Get, Endpoint::Container(id_or_name)) => get_container(manager, id_or_name).await,
+        (crate::api::Method::Post, Endpoint::ContainerCreate) => {
+            match serde_json::from_value::<CreateContainerRequest>(request.body) {
+                Ok(create_req) => create_container(manager, create_req).await,
+                Err(err) => Response::bad_request(format!("Invalid request body: {}", err)),
+            }
+        }
+        (crate::api::Method::Post, Endpoint::StartContainer(id_or_name)) => start_container(manager, id_or_name).await,
+        (crate::api::Method::Post, Endpoint::StopContainer(id_or_name)) => stop_container(manager, id_or_name).await,
+        (crate::api::Method::Delete, Endpoint::RemoveContainer(id_or_name)) => remove_container(manager, id_or_name, false).await,
+
         _ => Response::bad_request(format!(
             "Method {:?} not supported for endpoint {}",
             request.method, request.endpoint
@@ -318,6 +350,631 @@ async fn get_bootstrap_progress(manager: Arc<Mutex<JailManager>>, name: &str) ->
             }
         }
         None => Response::not_found(format!("No bootstrap progress for jail '{}'", name)),
+    }
+}
+
+// ============================================================================
+// Image Handlers
+// ============================================================================
+
+/// List all images
+async fn list_images(manager: Arc<Mutex<JailManager>>) -> Response {
+    let mgr = manager.lock().await;
+    let images = mgr.list_images();
+
+    let items: Vec<ImageListItem> = images
+        .into_iter()
+        .map(|image| ImageListItem {
+            id: image.id.clone(),
+            name: image.name.clone(),
+            size_bytes: image.size_bytes,
+            created_at: image.created_at,
+        })
+        .collect();
+
+    match Response::success(items) {
+        Ok(resp) => resp,
+        Err(_) => Response::internal_error("Failed to serialize image list"),
+    }
+}
+
+/// Get image by ID or name
+async fn get_image(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Response {
+    let mgr = manager.lock().await;
+
+    // Try ID first, then name
+    let id_or_name_string = id_or_name.to_string();
+    let image = mgr.get_image(&id_or_name_string).or_else(|| mgr.get_image_by_name(id_or_name));
+
+    match image {
+        Some(image) => {
+            let image_info = ImageInfo {
+                id: image.id.clone(),
+                name: image.name.clone(),
+                parent_id: image.parent_id.clone(),
+                size_bytes: image.size_bytes,
+                state: image.state.as_str().to_string(),
+                created_at: image.created_at,
+            };
+            match Response::success(image_info) {
+                Ok(resp) => resp,
+                Err(_) => Response::internal_error("Failed to serialize image info"),
+            }
+        }
+        None => Response::not_found(format!("Image '{}'", id_or_name)),
+    }
+}
+
+/// Build an image from a Dockerfile
+async fn build_image(manager: Arc<Mutex<JailManager>>, request: BuildImageRequest) -> Response {
+    // Validate request
+    if request.name.is_empty() {
+        return Response::bad_request("Image name cannot be empty");
+    }
+
+    if request.dockerfile.is_empty() {
+        return Response::bad_request("Dockerfile cannot be empty");
+    }
+
+    let mut mgr = manager.lock().await;
+
+    // Check if image with this name already exists
+    if let Some(existing) = mgr.get_image_by_name(&request.name) {
+        if existing.is_available() {
+            return Response::conflict(format!("Image '{}' already exists", request.name));
+        }
+    }
+
+    // Check if ZFS is available
+    let zfs_pool_name = if mgr.zfs.is_some() {
+        mgr.config.zfs_pool.clone()
+    } else {
+        return Response::internal_error("ZFS not configured");
+    };
+
+    let base_dataset = format!("{}/images", zfs_pool_name);
+
+    // Store build args for background task
+    let build_args = request.build_args.clone();
+
+    // Create ImageBuilder - note: we need to recreate Zfs in the background task
+    let _base_dataset_clone = base_dataset.clone();
+
+    // Parse dockerfile to get FROM image
+    let from_image = match parse_from_instruction(&request.dockerfile) {
+        Ok(from_name) => {
+            // Handle "scratch" as a special case - no base image
+            if from_name == "scratch" {
+                None
+            } else if let Some(img) = mgr.get_image_by_name(&from_name) {
+                Some(img.clone())
+            } else {
+                return Response::bad_request(format!(
+                    "Base image '{}' not found. Ensure the base image exists or build it first.",
+                    from_name
+                ));
+            }
+        }
+        Err(_) => None, // No FROM instruction
+    };
+
+    // Generate image ID
+    let image_id = Image::generate_id();
+    let image_id_clone = image_id.clone();
+    let name_clone = request.name.clone();
+    let dockerfile_clone = request.dockerfile.clone();
+    let from_image_clone = from_image.clone();
+    let build_args_clone = build_args.clone();
+
+    // Create progress channel
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(100);
+
+    // Register progress tracker
+    mgr.image_build_tracker.insert(image_id.clone(), progress_tx.clone());
+    mgr.image_build_progress.insert(
+        image_id.clone(),
+        ImageBuildProgress {
+            image_id: image_id.clone(),
+            step: 0,
+            total_steps: 0,
+            current_instruction: "Initializing...".to_string(),
+            status: crate::image_builder::BuildStatus::Building,
+        },
+    );
+
+    // Clone manager for background task
+    let manager_clone = manager.clone();
+
+    // Spawn background build task
+    tokio::spawn(async move {
+        // Create a new builder for the background task
+        let mgr_inner = manager_clone.lock().await;
+        let zfs_inner = match mgr_inner.zfs.as_ref() {
+            Some(_z) => {
+                // Create a new Zfs instance with the same pool
+                match crate::zfs::Zfs::new(&mgr_inner.config.zfs_pool) {
+                    Ok(z) => z,
+                    Err(_) => {
+                        let _ = progress_tx
+                            .send(ImageBuildProgress {
+                                image_id: image_id_clone.clone(),
+                                step: 0,
+                                total_steps: 0,
+                                current_instruction: "Failed to create ZFS instance".to_string(),
+                                status: crate::image_builder::BuildStatus::Failed,
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            }
+            None => {
+                let _ = progress_tx
+                    .send(ImageBuildProgress {
+                        image_id: image_id_clone.clone(),
+                        step: 0,
+                        total_steps: 0,
+                        current_instruction: "ZFS not configured".to_string(),
+                        status: crate::image_builder::BuildStatus::Failed,
+                    })
+                    .await;
+                return;
+            }
+        };
+
+        let base_dataset_inner = format!("{}/images", mgr_inner.config.zfs_pool);
+        drop(mgr_inner);
+
+        let (mut builder_inner, _rx) =
+            crate::image_builder::ImageBuilder::new(zfs_inner, base_dataset_inner);
+
+        // Set build args if provided
+        if !build_args_clone.is_empty() {
+            builder_inner = builder_inner.with_build_args(build_args_clone);
+        }
+
+        let result = builder_inner
+            .build(name_clone.clone(), &dockerfile_clone, from_image_clone.as_ref())
+            .await;
+
+        match result {
+            Ok(image) => {
+                // Store image in manager
+                let mut mgr_inner = manager_clone.lock().await;
+                if let Err(e) = mgr_inner.add_image(image.clone()) {
+                    tracing::error!("Failed to store image in manager: {}", e);
+                }
+
+                // Update progress to complete
+                mgr_inner.image_build_progress.insert(
+                    image_id_clone.clone(),
+                    ImageBuildProgress {
+                        image_id: image_id_clone.clone(),
+                        step: image.dockerfile.len(),
+                        total_steps: image.dockerfile.len(),
+                        current_instruction: "Build complete".to_string(),
+                        status: crate::image_builder::BuildStatus::Complete,
+                    },
+                );
+            }
+            Err(e) => {
+                tracing::error!("Image build failed: {}", e);
+
+                // Update progress to failed
+                let mut mgr_inner = manager_clone.lock().await;
+                mgr_inner.image_build_progress.insert(
+                    image_id_clone.clone(),
+                    ImageBuildProgress {
+                        image_id: image_id_clone.clone(),
+                        step: 0,
+                        total_steps: 0,
+                        current_instruction: format!("Build failed: {}", e),
+                        status: crate::image_builder::BuildStatus::Failed,
+                    },
+                );
+            }
+        }
+    });
+
+    // Spawn a task to forward progress updates to the manager
+    let manager_for_progress = manager.clone();
+    let image_id_for_progress = image_id.clone();
+    tokio::spawn(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            let mut mgr = manager_for_progress.lock().await;
+            // Update the stored progress
+            if let Some(stored) = mgr.image_build_progress.get_mut(&image_id_for_progress) {
+                *stored = progress.clone();
+            }
+        }
+    });
+
+    // Return immediately with 202 Accepted
+    Response::error(
+        202,
+        ApiError::new(
+            "BUILD_STARTED",
+            format!(
+                "Image build started for '{}'. ID: {}. Use GET /images/{}/history to track progress.",
+                request.name, image_id, image_id
+            ),
+        ),
+    )
+}
+
+/// Delete an image
+async fn delete_image(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Response {
+    let mut mgr = manager.lock().await;
+
+    // Try to find the image
+    let id_or_name_string = id_or_name.to_string();
+    let image_id = if let Some(image) = mgr.get_image(&id_or_name_string) {
+        image.id.clone()
+    } else if let Some(image) = mgr.get_image_by_name(id_or_name) {
+        image.id.clone()
+    } else {
+        return Response::not_found(format!("Image '{}'", id_or_name));
+    };
+
+    match mgr.remove_image(&image_id) {
+        Ok(()) => {
+            match Response::success(serde_json::json!({"message": format!("Image '{}' deleted", id_or_name)})) {
+                Ok(resp) => resp,
+                Err(_) => Response::internal_error("Failed to serialize response"),
+            }
+        }
+        Err(e) => Response::internal_error(format!("Failed to delete image: {}", e)),
+    }
+}
+
+/// Get image history
+async fn get_image_history(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Response {
+    let mgr = manager.lock().await;
+
+    // Try to find the image
+    let id_or_name_string = id_or_name.to_string();
+    let image = mgr.get_image(&id_or_name_string).or_else(|| mgr.get_image_by_name(id_or_name));
+
+    match image {
+        Some(img) => {
+            // Convert Dockerfile instructions to history items
+            let history: Vec<ImageHistoryItem> = img
+                .dockerfile
+                .iter()
+                .enumerate()
+                .map(|(idx, instr)| {
+                    let created_by = match instr {
+                        crate::image::DockerfileInstruction::From(img) => format!("FROM {}", img),
+                        crate::image::DockerfileInstruction::Run(cmd) => format!("RUN {}", cmd),
+                        crate::image::DockerfileInstruction::Copy { src, dest, .. } => {
+                            format!("COPY {} {}", src, dest)
+                        }
+                        crate::image::DockerfileInstruction::Add { src, dest } => {
+                            format!("ADD {} {}", src, dest)
+                        }
+                        crate::image::DockerfileInstruction::WorkDir(path) => {
+                            format!("WORKDIR {}", path)
+                        }
+                        crate::image::DockerfileInstruction::Env(env) => {
+                            format!("ENV {} vars", env.len())
+                        }
+                        crate::image::DockerfileInstruction::Expose(ports) => {
+                            format!("EXPOSE {:?}", ports)
+                        }
+                        crate::image::DockerfileInstruction::User(user) => format!("USER {}", user),
+                        crate::image::DockerfileInstruction::Volume(vols) => {
+                            format!("VOLUME {:?}", vols)
+                        }
+                        crate::image::DockerfileInstruction::Cmd(cmd) => format!("CMD {:?}", cmd),
+                        crate::image::DockerfileInstruction::Entrypoint(ep) => {
+                            format!("ENTRYPOINT {:?}", ep)
+                        }
+                        crate::image::DockerfileInstruction::Label(labels) => {
+                            format!("LABEL {} entries", labels.len())
+                        }
+                    };
+
+                    // Estimate layer size (in reality, each layer would have its own size)
+                    let layer_size = if !img.dockerfile.is_empty() {
+                        img.size_bytes / img.dockerfile.len() as u64
+                    } else {
+                        0
+                    };
+
+                    ImageHistoryItem {
+                        id: format!("{}-layer-{}", img.id, idx),
+                        created_at: img.created_at, // In reality, each layer would have its own timestamp
+                        size_bytes: layer_size,
+                        created_by,
+                    }
+                })
+                .collect();
+
+            match Response::success(history) {
+                Ok(resp) => resp,
+                Err(_) => Response::internal_error("Failed to serialize image history"),
+            }
+        }
+        None => Response::not_found(format!("Image '{}'", id_or_name)),
+    }
+}
+
+/// Helper: Parse the FROM instruction from a Dockerfile to get the base image name
+fn parse_from_instruction(dockerfile: &str) -> Result<String, &'static str> {
+    for line in dockerfile.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let line_upper = line.to_uppercase();
+        if line_upper.starts_with("FROM ") {
+            let parts = line[5..].trim().split_whitespace().collect::<Vec<_>>();
+            if !parts.is_empty() {
+                return Ok(parts[0].to_string());
+            }
+        }
+
+        // Stop after first non-FROM instruction
+        if !line_upper.starts_with("FROM") && !line_upper.starts_with('#') {
+            break;
+        }
+    }
+
+    Err("No FROM instruction found")
+}
+
+// ============================================================================
+// Container Handlers
+// ============================================================================
+
+/// List all containers
+async fn list_containers(manager: Arc<Mutex<JailManager>>) -> Response {
+    let mgr = manager.lock().await;
+    let containers = mgr.list_containers();
+
+    let items: Vec<ContainerListItem> = containers
+        .iter()
+        .map(|c| ContainerListItem {
+            id: c.id.clone(),
+            name: c.name.clone(),
+            image_id: c.image_id.clone(),
+            state: c.state.as_str().to_string(),
+            ip: c.ip.clone(),
+        })
+        .collect();
+
+    match Response::success(items) {
+        Ok(resp) => resp,
+        Err(_) => Response::internal_error("Failed to serialize container list"),
+    }
+}
+
+/// Get container by ID or name
+async fn get_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Response {
+    let mgr = manager.lock().await;
+
+    // Try ID first, then search by name
+    let id_or_name_string = id_or_name.to_string();
+    let container = mgr.get_container(&id_or_name_string).or_else(|| {
+        mgr.list_containers()
+            .into_iter()
+            .find(|c| c.name.as_deref() == Some(id_or_name))
+    });
+
+    match container {
+        Some(container) => {
+            let container_info = ContainerInfo {
+                id: container.id.clone(),
+                name: container.name.clone(),
+                image_id: container.image_id.clone(),
+                state: container.state.as_str().to_string(),
+                ip: container.ip.clone(),
+                restart_policy: container.restart_policy.as_str().to_string(),
+                created_at: container.created_at,
+                started_at: container.started_at,
+            };
+            match Response::success(container_info) {
+                Ok(resp) => resp,
+                Err(_) => Response::internal_error("Failed to serialize container info"),
+            }
+        }
+        None => Response::not_found(format!("Container '{}'", id_or_name)),
+    }
+}
+
+/// Create container from image
+async fn create_container(manager: Arc<Mutex<JailManager>>, request: CreateContainerRequest) -> Response {
+    let mut mgr = manager.lock().await;
+
+    // Validate image exists
+    let image = mgr.get_image(&request.image_id)
+        .or_else(|| mgr.get_image_by_name(&request.image_id));
+
+    if image.is_none() {
+        return Response::not_found(format!("Image '{}'", request.image_id));
+    }
+
+    // Parse restart policy
+    let restart_policy = match request.restart_policy.parse::<RestartPolicy>() {
+        Ok(policy) => policy,
+        Err(_) => {
+            return Response::bad_request(format!("Invalid restart policy: {}", request.restart_policy));
+        }
+    };
+
+    // Convert API port mappings to internal format
+    let port_mappings: Vec<crate::container::PortMapping> = request.ports
+        .into_iter()
+        .map(|p| {
+            let protocol = match p.protocol.as_str() {
+                "tcp" => crate::container::PortProtocol::Tcp,
+                "udp" => crate::container::PortProtocol::Udp,
+                _ => crate::container::PortProtocol::Tcp,
+            };
+            crate::container::PortMapping::new(p.host_port, p.container_port, protocol)
+        })
+        .collect();
+
+    // Convert API mounts to internal format
+    let mounts: Vec<crate::container::Mount> = request.volumes
+        .into_iter()
+        .map(|v| {
+            let mount_type = match v.mount_type.as_str() {
+                "zfs" => crate::container::MountType::Zfs,
+                "nullfs" => crate::container::MountType::Nullfs,
+                _ => crate::container::MountType::Nullfs,
+            };
+            crate::container::Mount::new(v.source, v.destination, mount_type, false)
+        })
+        .collect();
+
+    // Create container config
+    let config = crate::container::ContainerConfig {
+        image_id: request.image_id.clone(),
+        name: request.name.clone(),
+        ports: port_mappings,
+        volumes: mounts,
+        restart_policy,
+    };
+
+    match mgr.create_container(config) {
+        Ok(container) => {
+            let container_info = ContainerInfo {
+                id: container.id.clone(),
+                name: container.name.clone(),
+                image_id: container.image_id.clone(),
+                state: container.state.as_str().to_string(),
+                ip: container.ip.clone(),
+                restart_policy: container.restart_policy.as_str().to_string(),
+                created_at: container.created_at,
+                started_at: container.started_at,
+            };
+            match Response::created(container_info) {
+                Ok(resp) => resp,
+                Err(_) => Response::internal_error("Failed to serialize container info"),
+            }
+        }
+        Err(e) => Response::internal_error(format!("Failed to create container: {}", e)),
+    }
+}
+
+/// Start container
+async fn start_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Response {
+    let mut mgr = manager.lock().await;
+
+    // Find container by ID or name
+    let id_or_name_string = id_or_name.to_string();
+    let container_id = if let Some(_) = mgr.get_container(&id_or_name_string) {
+        id_or_name_string
+    } else {
+        match mgr.list_containers()
+            .into_iter()
+            .find(|c| c.name.as_deref() == Some(id_or_name))
+        {
+            Some(c) => c.id.clone(),
+            None => return Response::not_found(format!("Container '{}'", id_or_name)),
+        }
+    };
+
+    match mgr.start_container(&container_id) {
+        Ok(()) => {
+            let container = mgr.get_container(&container_id).unwrap();
+            let container_info = ContainerInfo {
+                id: container.id.clone(),
+                name: container.name.clone(),
+                image_id: container.image_id.clone(),
+                state: container.state.as_str().to_string(),
+                ip: container.ip.clone(),
+                restart_policy: container.restart_policy.as_str().to_string(),
+                created_at: container.created_at,
+                started_at: container.started_at,
+            };
+            match Response::success(container_info) {
+                Ok(resp) => resp,
+                Err(_) => Response::internal_error("Failed to serialize container info"),
+            }
+        }
+        Err(e) => Response::internal_error(format!("Failed to start container: {}", e)),
+    }
+}
+
+/// Stop container
+async fn stop_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Response {
+    let mut mgr = manager.lock().await;
+
+    // Find container by ID or name
+    let id_or_name_string = id_or_name.to_string();
+    let container_id = if let Some(_) = mgr.get_container(&id_or_name_string) {
+        id_or_name_string
+    } else {
+        match mgr.list_containers()
+            .into_iter()
+            .find(|c| c.name.as_deref() == Some(id_or_name))
+        {
+            Some(c) => c.id.clone(),
+            None => return Response::not_found(format!("Container '{}'", id_or_name)),
+        }
+    };
+
+    match mgr.stop_container(&container_id) {
+        Ok(()) => {
+            let container = mgr.get_container(&container_id).unwrap();
+            let container_info = ContainerInfo {
+                id: container.id.clone(),
+                name: container.name.clone(),
+                image_id: container.image_id.clone(),
+                state: container.state.as_str().to_string(),
+                ip: container.ip.clone(),
+                restart_policy: container.restart_policy.as_str().to_string(),
+                created_at: container.created_at,
+                started_at: container.started_at,
+            };
+            match Response::success(container_info) {
+                Ok(resp) => resp,
+                Err(_) => Response::internal_error("Failed to serialize container info"),
+            }
+        }
+        Err(e) => Response::internal_error(format!("Failed to stop container: {}", e)),
+    }
+}
+
+/// Remove container
+async fn remove_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str, force: bool) -> Response {
+    let mut mgr = manager.lock().await;
+
+    // Find container by ID or name
+    let id_or_name_string = id_or_name.to_string();
+    let container_id = if let Some(_) = mgr.get_container(&id_or_name_string) {
+        id_or_name_string
+    } else {
+        match mgr.list_containers()
+            .into_iter()
+            .find(|c| c.name.as_deref() == Some(id_or_name))
+        {
+            Some(c) => c.id.clone(),
+            None => return Response::not_found(format!("Container '{}'", id_or_name)),
+        }
+    };
+
+    // Check if container is running
+    if let Some(container) = mgr.get_container(&container_id) {
+        if container.is_running() && !force {
+            return Response::bad_request(format!(
+                "Container '{}' is running. Stop it first or use force flag.",
+                id_or_name
+            ));
+        }
+    }
+
+    match mgr.remove_container(&container_id) {
+        Ok(()) => {
+            match Response::success(serde_json::json!({"message": format!("Container '{}' removed", id_or_name)})) {
+                Ok(resp) => resp,
+                Err(_) => Response::internal_error("Failed to serialize response"),
+            }
+        }
+        Err(e) => Response::internal_error(format!("Failed to remove container: {}", e)),
     }
 }
 

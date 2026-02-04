@@ -1,0 +1,9 @@
+# Base FreeBSD 15.0-RELEASE image
+# This is the base layer for all other images
+FROM scratch
+
+# Set working directory
+WORKDIR /root
+
+# This image is bootstrapped with FreeBSD base system
+# Build using: kawakaze build --name freebsd-15.0-release Dockerfile.base

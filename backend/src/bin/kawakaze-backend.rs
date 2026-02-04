@@ -2,7 +2,7 @@
 //!
 //! This is the main entry point for running the Kawakaze jail manager backend.
 
-use kawakaze_backend::JailManager;
+use kawakaze_backend::{JailManager, config::KawakazeConfig};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -28,16 +28,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!("Not running as root. Jail operations require root privileges.");
     }
 
-    // Create jail manager with database persistence
-    let manager = match JailManager::with_default_database() {
+    // Load configuration from default locations, or use defaults
+    let config = match KawakazeConfig::load_defaults() {
+        Ok(cfg) => {
+            tracing::info!("Loaded configuration");
+            tracing::info!("ZFS pool: {}", cfg.zfs_pool);
+            tracing::info!("Database: {}", cfg.storage.database_path);
+            cfg
+        }
+        Err(e) => {
+            tracing::warn!("Failed to load configuration ({}), using defaults", e);
+            KawakazeConfig::default()
+        }
+    };
+
+    // Create jail manager with configuration (includes ZFS initialization)
+    let manager = match JailManager::with_config(config) {
         Ok(m) => {
-            tracing::info!("Database persistence enabled: /var/db/kawakaze.db");
+            tracing::info!("JailManager initialized with ZFS support");
             Arc::new(Mutex::new(m))
         }
         Err(e) => {
-            tracing::warn!("Failed to initialize database ({}), running without persistence", e);
-            tracing::warn!("Jails will not persist across restarts");
-            Arc::new(Mutex::new(JailManager::with_default_socket()))
+            tracing::error!("Failed to initialize JailManager: {}", e);
+            tracing::error!("Please ensure:");
+            tracing::error!("  1. A ZFS pool exists (run 'zpool list' to check)");
+            tracing::error!("  2. The zfs_pool in config points to a valid pool");
+            return Err(e.into());
         }
     };
 

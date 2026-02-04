@@ -128,6 +128,9 @@ Key modules:
 - `server.rs` - Unix socket server with JsonCodec
 - `store.rs` - SQLite persistence layer
 - `bootstrap.rs` - FreeBSD base system bootstrapping
+- `image_builder.rs` - Dockerfile-to-image builder with ZFS layer management
+- `image.rs` - Image data structures and Dockerfile instruction types
+- `container.rs` - Container lifecycle and management
 
 ### `cli` crate
 Command-line interface that communicates with the backend daemon. Can:
@@ -144,7 +147,64 @@ The backend runs as a daemon (`kawakazed`) that listens on a Unix socket. The CL
 
 ## FreeBSD Jail Bootstrapping
 
-The backend can bootstrap jails with a complete FreeBSD base system:
+The backend can bootstrap jails with a complete FreeBSD base system. Bootstrapping can be done either via API endpoints or via the `BOOTSTRAP` Dockerfile instruction when building images.
+
+### Dockerfile BOOTSTRAP Instruction
+
+The `BOOTSTRAP` instruction can be used in Dockerfiles to automatically bootstrap a FreeBSD base system during image build. This is particularly useful for creating base images from scratch.
+
+**Syntax:**
+```dockerfile
+FROM scratch
+BOOTSTRAP [VERSION] [ARCHITECTURE] [MIRROR]
+```
+
+**Parameters:**
+- `VERSION` - Optional: FreeBSD version (e.g., "15.0-RELEASE"). Auto-detected from host if not specified.
+- `ARCHITECTURE` - Optional: Architecture (e.g., "amd64", "aarch64"). Auto-detected from host if not specified.
+- `MIRROR` - Optional: Custom mirror URL. Uses official FreeBSD mirrors if not specified.
+
+**Examples:**
+
+Basic base image with auto-detection:
+```dockerfile
+FROM scratch
+BOOTSTRAP
+WORKDIR /root
+```
+
+Specify a specific FreeBSD version:
+```dockerfile
+FROM scratch
+BOOTSTRAP 15.0-RELEASE
+```
+
+Specify version and architecture:
+```dockerfile
+FROM scratch
+BOOTSTRAP 14.2-RELEASE amd64
+```
+
+Use a custom mirror:
+```dockerfile
+FROM scratch
+BOOTSTRAP 15.0-RELEASE amd64 https://mirror.example.com/freebsd
+```
+
+**Example base image (`Dockerfile.base`):**
+```dockerfile
+# Base FreeBSD 15.0-RELEASE image
+FROM scratch
+
+# Bootstrap FreeBSD base system
+# Downloads and installs the complete FreeBSD base system
+BOOTSTRAP
+
+# Set working directory
+WORKDIR /root
+```
+
+**Note:** When building an image with `BOOTSTRAP`, the base system is downloaded during the build process and cached in `/var/cache/kawakaze/` for future builds. This significantly speeds up subsequent builds.
 
 ### API Endpoints
 
@@ -194,7 +254,89 @@ Response:
 1. Download official FreeBSD `base.txz` from CDN (~150MB compressed, ~500MB extracted)
 2. Verify SHA256 checksum
 3. Extract to jail path using tar + xz
-4. Generate minimal config files (`rc.conf`, `resolv.conf`, `hosts`)
+4. Generate configuration files:
+   - `/etc/rc.conf` - Basic RC configuration
+   - `/etc/resolv.conf` - DNS configuration
+   - `/etc/hosts` - Hostname mapping
+   - `/etc/profile` - System-wide shell profile with PATH
+   - `/root/.profile` - Root user profile with PATH
+   - `/root/.cshrc` - Root user csh/tcsh configuration with PATH
 5. Cache tarball at `/var/cache/kawakaze/` for future use
 
 Bootstrap runs asynchronously in background - the API returns immediately after starting the operation.
+
+### PATH Configuration
+
+When bootstrapping a jail, Kawakaze automatically configures the PATH environment variable in shell profiles:
+
+- **System-wide profile** (`/etc/profile`): Sets `PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:~/bin`
+- **Root user profile** (`/root/.profile`): Sets the same PATH for sh/bash shells
+- **Root user cshrc** (`/root/.cshrc`): Sets the same PATH for csh/tcsh shells
+
+This ensures that commands like `ls`, `uname`, and other FreeBSD utilities work correctly when executing commands in containers. The PATH is also passed automatically when using the `exec` command, so even if shell profiles aren't loaded, commands will work properly.
+
+**Example:**
+```bash
+# These commands now work correctly in bootstrapped containers
+kawakaze exec <container-id> uname -a
+kawakaze exec <container-id> ls -la /root
+```
+
+## Dockerfile Instructions
+
+Kawakaze supports a subset of Dockerfile instructions for building images:
+
+### Supported Instructions
+
+- `FROM <image>` - Specify base image (use `scratch` for empty base)
+- `BOOTSTRAP [VERSION] [ARCH] [MIRROR]` - Bootstrap FreeBSD base system
+- `RUN <command>` - Execute command during build
+- `COPY <src> <dest>` - Copy files from build context
+- `ADD <src> <dest>` - Copy files (with URL support)
+- `WORKDIR <path>` - Set working directory
+- `ENV <key> <value>` - Set environment variables
+- `EXPOSE <port> ...` - Expose ports
+- `USER <username>` - Set user for RUN/CMD/ENTRYPOINT
+- `VOLUME <path> ...` - Create mount points
+- `CMD <command>` - Default command to run
+- `ENTRYPOINT <command>` - Container entrypoint
+- `LABEL <key> <value>` - Add metadata labels
+- `ARG <name>[=default]` - Build-time variables
+- `STOPSIGNAL <signal>` - Signal to stop container
+- `SHELL <command>` - Default shell for RUN commands
+
+### Special Instructions
+
+**`BOOTSTRAP`** - Kawakaze-specific instruction to bootstrap a FreeBSD base system during image build. See "FreeBSD Jail Bootstrapping" section above for details.
+
+### Example Dockerfiles
+
+**Simple base image:**
+```dockerfile
+FROM scratch
+BOOTSTRAP
+WORKDIR /root
+```
+
+**Web server image:**
+```dockerfile
+FROM freebsd-base
+RUN pkg install -y nginx
+EXPOSE 80 443
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+**Development environment:**
+```dockerfile
+FROM freebsd-base
+RUN pkg install -y rust git vim
+WORKDIR /workspace
+ENV PATH=/usr/local/bin:$PATH
+VOLUME /workspace
+```
+- Always use descriptive names
+- After finishing a feature, make sure to write unit tests, integration tests, and system tests for it. You should test the behaviour of every edge case you can think of to make sure that it's as expected. Use additional test case libraries, or coverage libraries if you need to.
+- Update CLAUDE.md if the information is out of date or if there is anything important that is added
+- Write unit, integration, and system tests for any code that you write. Make sure that all paths are covered.
+- Commit the code whenever a feature has been added and it's been thoroughly tested.
+- You don't need to preserve any backwards compatibility or worry about deleting existing containers or images.

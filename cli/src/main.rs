@@ -41,6 +41,12 @@ enum Commands {
         /// Container name
         #[arg(short, long)]
         name: Option<String>,
+        /// Interactive mode (keep STDIN open)
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// Pseudo-TTY (allocate a terminal)
+        #[arg(short = 't', long)]
+        tty: bool,
         /// Publish port (hostPort:containerPort or hostPort:containerPort/protocol)
         #[arg(short = 'p', long)]
         publish: Vec<String>,
@@ -116,6 +122,12 @@ enum Commands {
     Exec {
         /// Container ID or name
         container: String,
+        /// Interactive mode (keep STDIN open)
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// Pseudo-TTY (allocate a terminal)
+        #[arg(short = 't', long)]
+        tty: bool,
         /// Command to execute
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
@@ -142,6 +154,8 @@ async fn main() {
         Commands::Run {
             image,
             name,
+            interactive,
+            tty,
             publish,
             volume,
             env,
@@ -150,7 +164,7 @@ async fn main() {
             user: _,
             command,
         } => {
-            run_container(image, name, publish, volume, env, restart, command).await
+            run_container(image, name, interactive, tty, publish, volume, env, restart, command).await
         }
 
         Commands::Ps => list_containers().await,
@@ -171,7 +185,12 @@ async fn main() {
             tail,
         } => container_logs(container, follow, tail).await,
 
-        Commands::Exec { container, command } => exec_container(container, command).await,
+        Commands::Exec {
+            container,
+            interactive,
+            tty,
+            command,
+        } => exec_container(container, interactive, tty, command).await,
 
         Commands::Inspect { id } => inspect(id).await,
     };
@@ -282,6 +301,8 @@ async fn build_image(
 async fn run_container(
     image: String,
     name: Option<String>,
+    interactive: bool,
+    tty: bool,
     publish: Vec<String>,
     volume: Vec<String>,
     env: Vec<String>,
@@ -323,7 +344,7 @@ async fn run_container(
         command: if command.is_empty() {
             None
         } else {
-            Some(command)
+            Some(command.clone())
         },
     };
 
@@ -346,6 +367,19 @@ async fn run_container(
     send_request(start_request).await?;
 
     println!("Started container: {}", container_id);
+
+    // If interactive or tty mode, attach to the container
+    if interactive || tty {
+        // Default command is /bin/sh if no command was specified
+        let attach_command = if command.is_empty() {
+            vec!["/bin/sh".to_string()]
+        } else {
+            command
+        };
+
+        // Reuse the exec logic to attach
+        exec_container(container_id.to_string(), interactive, tty, attach_command).await?;
+    }
 
     Ok(())
 }
@@ -556,41 +590,390 @@ async fn container_logs(container: String, follow: bool, tail: usize) -> Result<
 }
 
 /// Execute a command in a container
-async fn exec_container(container: String, command: Vec<String>) -> Result<(), String> {
+async fn exec_container(container: String, interactive: bool, tty: bool, command: Vec<String>) -> Result<(), String> {
     if command.is_empty() {
         return Err("No command specified".to_string());
     }
 
-    let exec_request = ExecRequest {
-        command: command.clone(),
-        env: HashMap::new(),
-        workdir: None,
-    };
+    // TTY mode: use forkpty to allocate a pseudo-terminal
+    if tty {
+        // First, we need to get the jail name by querying the container
+        let request = Request::get(Endpoint::Container(container.clone()));
+        let response = send_request(request).await?;
 
-    let request =
-        Request::post(Endpoint::ContainerExec(container), exec_request).map_err(|e| e.to_string())?;
+        let jail_name = response.get("jail_name")
+            .and_then(|v| v.as_str())
+            .ok_or("Failed to get jail name from container")?;
 
-    println!("Executing: {}", command.join(" "));
+        // Build the command string
+        let cmd_str = shell_words::join(&command);
 
-    let response = send_request(request).await?;
+        exec_with_pty(jail_name, &cmd_str)?;
+        Ok(())
+    } else if interactive {
+        // Interactive mode without PTY: run jexec directly with stdin/stdout connected
+        // First, we need to get the jail name by querying the container
+        let request = Request::get(Endpoint::Container(container.clone()));
+        let response = send_request(request).await?;
 
-    // Print output
-    if let Some(stdout) = response.get("stdout").and_then(|v| v.as_str()) {
-        print!("{}", stdout);
-    }
+        let jail_name = response.get("jail_name")
+            .and_then(|v| v.as_str())
+            .ok_or("Failed to get jail name from container")?;
 
-    if let Some(stderr) = response.get("stderr").and_then(|v| v.as_str()) {
-        eprint!("{}", stderr);
-    }
+        // Build the command string
+        let cmd_str = shell_words::join(&command);
 
-    // Check exit code
-    if let Some(exit_code) = response.get("exit_code").and_then(|v| v.as_i64()) {
+        // Run jexec interactively, connecting stdin/stdout/stderr directly
+        // This gives the user an interactive shell
+        let status = std::process::Command::new("jexec")
+            .arg("-l")  // Login shell to load profiles
+            .arg(jail_name)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(&cmd_str)
+            .status()
+            .map_err(|e| format!("Failed to execute command: {}", e))?;
+
+        let exit_code = status.code().unwrap_or(-1);
         if exit_code != 0 {
             return Err(format!("Command exited with code {}", exit_code));
         }
+
+        Ok(())
+    } else {
+        // Non-interactive mode: use backend API
+        let exec_request = ExecRequest {
+            command: command.clone(),
+            env: HashMap::new(),
+            workdir: None,
+        };
+
+        let request =
+            Request::post(Endpoint::ContainerExec(container), exec_request).map_err(|e| e.to_string())?;
+
+        println!("Executing: {}", command.join(" "));
+
+        let response = send_request(request).await?;
+
+        // Print output
+        if let Some(stdout) = response.get("stdout").and_then(|v| v.as_str()) {
+            print!("{}", stdout);
+        }
+
+        if let Some(stderr) = response.get("stderr").and_then(|v| v.as_str()) {
+            eprint!("{}", stderr);
+        }
+
+        // Check exit code
+        if let Some(exit_code) = response.get("exit_code").and_then(|v| v.as_i64()) {
+            if exit_code != 0 {
+                return Err(format!("Command exited with code {}", exit_code));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Execute command in a jail with a pseudo-TTY
+#[cfg(target_os = "freebsd")]
+fn exec_with_pty(jail_name: &str, command: &str) -> Result<(), String> {
+    use std::fs::File;
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    use std::ptr;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
+
+    // Signal handler for SIGWINCH (terminal resize)
+    extern "C" fn sigwinch_handler(_: libc::c_int) {
+        // Signal handler will be set up in parent
     }
 
-    Ok(())
+    // Terminal size structure
+    #[repr(C)]
+    struct Winsize {
+        ws_row: libc::c_ushort,
+        ws_col: libc::c_ushort,
+        ws_xpixel: libc::c_ushort,
+        ws_ypixel: libc::c_ushort,
+    }
+
+    // Get current terminal size
+    fn get_terminal_size() -> Winsize {
+        unsafe {
+            let mut size: Winsize = std::mem::zeroed();
+            libc::ioctl(0, libc::TIOCGWINSZ, &mut size as *mut _ as *mut _);
+            size
+        }
+    }
+
+    // Set terminal size on a file descriptor
+    fn set_terminal_size(fd: i32, size: &Winsize) {
+        unsafe {
+            libc::ioctl(fd, libc::TIOCSWINSZ, size as *const _ as *const _);
+        }
+    }
+
+    // Get current terminal attributes
+    fn get_terminal_attributes(fd: i32) -> Option<libc::termios> {
+        unsafe {
+            let mut term: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut term) == 0 {
+                Some(term)
+            } else {
+                None
+            }
+        }
+    }
+
+    // Setup PTY and fork using forkpty
+    let mut master_fd: libc::c_int = -1;
+
+    // Get the current terminal settings to use as base for PTY
+    let orig_term = get_terminal_attributes(0);
+
+    // forkpty creates a pseudo-terminal and forks
+    let pid = unsafe {
+        // Note: On FreeBSD, forkpty takes a pointer to the master fd,
+        // NULL for name (don't set slave name), termios for terminal settings,
+        // and winsize for initial size
+        let size = get_terminal_size();
+        libc::forkpty(
+            &mut master_fd,
+            ptr::null_mut(),
+            orig_term.as_ref().map(|t| t as *const _ as *mut _).unwrap_or(ptr::null_mut()),
+            &size as *const _ as *mut _,
+        )
+    };
+
+    if pid < 0 {
+        return Err(format!("forkpty failed: {}", std::io::Error::last_os_error()));
+    }
+
+    if pid == 0 {
+        // Child process: run jexec with the PTY slave as stdin/stdout/stderr
+        // Note: forkpty already set up the slave PTY as stdin/stdout/stderr
+        unsafe {
+            // Close master in child (we only use the slave PTY)
+            libc::close(master_fd);
+
+            // Set initial terminal size on stdin (which is the slave PTY)
+            let size = get_terminal_size();
+            set_terminal_size(0, &size);
+
+            // Execute jexec
+            let jail_name_c = std::ffi::CString::new(jail_name).unwrap();
+            let shell_path = b"/bin/sh\0".as_ptr() as *const i8;
+            let sh_flag = b"-c\0".as_ptr() as *const i8;
+            let command_c = std::ffi::CString::new(command).unwrap();
+
+            let _argv = [
+                shell_path,
+                sh_flag,
+                command_c.as_ptr(),
+                ptr::null(),
+            ];
+
+            libc::execvp(
+                b"jexec\0".as_ptr() as *const i8,
+                [
+                    b"jexec\0".as_ptr() as *const i8,
+                    b"-l\0".as_ptr() as *const i8,
+                    jail_name_c.as_ptr(),
+                    shell_path,
+                    sh_flag,
+                    command_c.as_ptr(),
+                    ptr::null(),
+                ].as_ptr(),
+            );
+
+            // execvp only returns on failure
+            libc::_exit(1);
+        }
+    } else {
+        // Parent process: forward I/O between stdin/stdout and the PTY master
+        unsafe {
+            // Set master_fd to non-blocking
+            let flags = libc::fcntl(master_fd, libc::F_GETFL, 0);
+            if flags >= 0 {
+                libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
+
+            // Set stdin to non-blocking
+            let stdin_flags = libc::fcntl(0, libc::F_GETFL, 0);
+            if stdin_flags >= 0 {
+                libc::fcntl(0, libc::F_SETFL, stdin_flags | libc::O_NONBLOCK);
+            }
+
+            // Set stdout to non-blocking
+            let stdout_flags = libc::fcntl(1, libc::F_GETFL, 0);
+            if stdout_flags >= 0 {
+                libc::fcntl(1, libc::F_SETFL, stdout_flags | libc::O_NONBLOCK);
+            }
+
+            // Put stdin into raw mode to disable local echo (PTY will handle echoing)
+            let mut orig_term_settings: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(0, &mut orig_term_settings) == 0 {
+                let mut raw_term = orig_term_settings;
+                libc::cfmakeraw(&mut raw_term);
+                libc::tcsetattr(0, libc::TCSANOW, &raw_term);
+            }
+
+            // Set initial terminal size
+            let size = get_terminal_size();
+            set_terminal_size(master_fd, &size);
+
+            let mut master_file = File::from_raw_fd(master_fd);
+            let stdin = std::io::stdin();
+            let mut stdin_lock = stdin.lock();
+
+            // Buffer for I/O
+            let mut buffer = [0u8; 8192];
+
+            // Track if we should continue running
+            let running = std::sync::Arc::new(AtomicBool::new(true));
+
+            // Clone running for signal handler thread
+            let running_clone = running.clone();
+
+            // Spawn a thread to handle SIGWINCH
+            let master_fd_clone = master_fd;
+            thread::spawn(move || {
+                // Set up signal handler
+                let mut sa: libc::sigaction = std::mem::zeroed();
+                sa.sa_sigaction = sigwinch_handler as usize;
+                sa.sa_flags = libc::SA_RESTART;
+                libc::sigemptyset(&mut sa.sa_mask);
+                libc::sigaction(libc::SIGWINCH, &sa, ptr::null_mut());
+
+                // Wait for signals
+                while running_clone.load(Ordering::Relaxed) {
+                    thread::sleep(std::time::Duration::from_millis(100));
+                    // Check for terminal size changes
+                    let size = get_terminal_size();
+                    set_terminal_size(master_fd_clone, &size);
+                }
+            });
+
+            // Main I/O loop
+            let _exit_status: Option<i32> = None;
+
+            while running.load(Ordering::Relaxed) {
+                let mut activity = false;
+
+                // Read from PTY master and write to stdout
+                match master_file.read(&mut buffer) {
+                    Ok(0) => {
+                        // EOF from PTY - child process closed
+                        break;
+                    }
+                    Ok(n) => {
+                        let stdout_fd = 1 as i32;
+                        let mut written = 0;
+                        while written < n {
+                            match libc::write(stdout_fd, buffer[written..].as_ptr() as *const libc::c_void, n - written) {
+                                -1 => {
+                                    let err = std::io::Error::last_os_error();
+                                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                                        // stdout would block, try again later
+                                        break;
+                                    } else {
+                                        // Restore terminal settings before returning
+                                        libc::tcsetattr(0, libc::TCSANOW, &orig_term_settings);
+                                        return Err(format!("Failed to write to stdout: {}", err));
+                                    }
+                                }
+                                n_written => {
+                                    written += n_written as usize;
+                                    activity = true;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::WouldBlock {
+                            // Restore terminal settings before returning
+                            libc::tcsetattr(0, libc::TCSANOW, &orig_term_settings);
+                            return Err(format!("Failed to read from PTY: {}", e));
+                        }
+                    }
+                }
+
+                // Read from stdin and write to PTY master
+                match stdin_lock.read(&mut buffer) {
+                    Ok(0) => {
+                        // EOF from stdin - close PTY write end
+                        let _ = libc::shutdown(master_fd, libc::SHUT_WR);
+                    }
+                    Ok(n) => {
+                        let mut written = 0;
+                        while written < n {
+                            match libc::write(master_fd, buffer[written..].as_ptr() as *const libc::c_void, n - written) {
+                                -1 => {
+                                    let err = std::io::Error::last_os_error();
+                                    if err.kind() == std::io::ErrorKind::WouldBlock {
+                                        // PTY would block, try again later
+                                        break;
+                                    } else {
+                                        // Restore terminal settings before returning
+                                        libc::tcsetattr(0, libc::TCSANOW, &orig_term_settings);
+                                        return Err(format!("Failed to write to PTY: {}", err));
+                                    }
+                                }
+                                n_written => {
+                                    written += n_written as usize;
+                                    activity = true;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::WouldBlock {
+                            // Error reading from stdin
+                            break;
+                        }
+                    }
+                }
+
+                // Small sleep to avoid busy waiting
+                if !activity {
+                    thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }
+
+            running.store(false, Ordering::Relaxed);
+
+            // Wait for child process
+            let mut status: libc::c_int = 0;
+            if libc::waitpid(pid, &mut status, 0) < 0 {
+                // Restore terminal settings before returning
+                libc::tcsetattr(0, libc::TCSANOW, &orig_term_settings);
+                return Err(format!("waitpid failed: {}", std::io::Error::last_os_error()));
+            }
+
+            // Restore terminal settings
+            libc::tcsetattr(0, libc::TCSANOW, &orig_term_settings);
+
+            if libc::WIFEXITED(status) {
+                let exit_code = libc::WEXITSTATUS(status);
+                if exit_code != 0 {
+                    return Err(format!("Command exited with code {}", exit_code));
+                }
+            } else if libc::WIFSIGNALED(status) {
+                let signal = libc::WTERMSIG(status);
+                return Err(format!("Command terminated by signal {}", signal));
+            }
+
+            Ok(())
+        }
+    }
+}
+
+/// Stub for non-FreeBSD platforms (compile error)
+#[cfg(not(target_os = "freebsd"))]
+fn exec_with_pty(_jail_name: &str, _command: &str) -> Result<(), String> {
+    Err("PTY mode is only supported on FreeBSD".to_string())
 }
 
 /// Inspect an image or container

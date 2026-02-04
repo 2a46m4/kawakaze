@@ -307,6 +307,13 @@ impl JailManager {
         let port_mappings: Vec<crate::container::PortMapping> = serde_json::from_str(&store_container.port_mappings)
             .map_err(|e| format!("Failed to parse port_mappings: {}", e))?;
 
+        // Parse command from JSON (optional)
+        let command: Option<Vec<String>> = store_container.command
+            .as_ref()
+            .map(|cmd_json| serde_json::from_str(cmd_json))
+            .transpose()
+            .map_err(|e| format!("Failed to parse command: {}", e))?;
+
         let restart_policy = store_container.restart_policy.parse::<RestartPolicy>()
             .map_err(|e| format!("Failed to parse restart_policy: {}", e))?;
 
@@ -318,17 +325,7 @@ impl JailManager {
             crate::store::ContainerState::Removing => ContainerState::Removing,
         };
 
-        // Note: We can't reconstruct the full Container with ContainerConfig, so we create a minimal one
-        // The actual Container type doesn't have a simple from_db_row method like Jail
-        // For now, we'll store minimal info and reconstruct as needed
-
-        // Actually, looking at the Container structure, it doesn't have a simple constructor
-        // Let me check how containers are created...
-
-        // For now, let's just store the essential info - the full container loading will need
-        // the Container::new constructor which we can't easily call here without refactoring
-
-        // As a workaround, let's create a container using the available info
+        // Create container with the loaded data including command
         Ok(Container::new_with_existing_data(
             store_container.id,
             store_container.name,
@@ -340,6 +337,7 @@ impl JailManager {
             mounts,
             port_mappings,
             store_container.ip,
+            command,
             store_container.created_at,
             store_container.started_at,
         ))
@@ -700,22 +698,35 @@ impl JailManager {
             zfs.clone_snapshot(&image.snapshot, &dataset)?;
         }
 
-        // Create the FreeBSD jail
-        let mount_point = format!("/{}", dataset.replace('/', "_"));
+        // Mount the container dataset to a directory so the jail can access the files
+        let container_mountpoint = std::path::PathBuf::from(format!("/var/db/kawakaze/containers/{}", &container_id[..8]));
+        if let Some(ref zfs) = self.zfs {
+            zfs.mount_dataset(&dataset, &container_mountpoint)
+                .map_err(|e| StoreError::SerializationError(format!("Failed to mount container dataset: {}", e)))?;
+        }
+
+        // Create the FreeBSD jail with the mounted path
         let jail = crate::jail::Jail::create(&jail_name)
-            .and_then(|j| j.with_path(&mount_point))
+            .and_then(|j| j.with_path(&container_mountpoint))
             .map_err(|e| StoreError::SerializationError(format!("Failed to create jail: {}", e)))?;
 
         // Add to jails HashMap
         self.jails.insert(jail_name.clone(), jail);
 
         // Create container with the pre-generated ID
-        let container = Container::new_with_id(container_id.clone(), config.image_id.clone(), jail_name, dataset)
+        let mut container = Container::new_with_id(container_id.clone(), config.image_id.clone(), jail_name, dataset)
             .with_name(config.name.unwrap_or_else(|| container_id.clone()))
             .with_restart_policy(config.restart_policy);
 
         // Store in database
         if let Some(ref store) = self.store {
+            // Serialize command to JSON for storage (before we move it to the container)
+            let command_json = config.command
+                .as_ref()
+                .map(|cmd| serde_json::to_string(&cmd)
+                    .map_err(|e| StoreError::SerializationError(e.to_string())))
+                .transpose()?;
+
             let store_container = crate::store::Container {
                 id: container.id.clone(),
                 name: container.name.clone(),
@@ -729,10 +740,16 @@ impl JailManager {
                 port_mappings: serde_json::to_string(&container.port_mappings)
                     .map_err(|e| StoreError::SerializationError(e.to_string()))?,
                 ip: container.ip.clone(),
+                command: command_json,
                 created_at: container.created_at,
                 started_at: container.started_at,
             };
             store.insert_container(&store_container)?;
+        }
+
+        // Set command if provided (after database storage since we move the value)
+        if let Some(command) = config.command {
+            container = container.with_command(command);
         }
 
         self.containers.insert(container_id.clone(), container.clone());
@@ -757,14 +774,33 @@ impl JailManager {
             }
         }
 
-        // Get the jail name first
-        let jail_name = self.containers.get(id)
-            .ok_or_else(|| StoreError::SerializationError(format!("Container {} not found", id)))?
-            .jail_name.clone();
+        // Clone the data we need before starting the jail
+        let (jail_name, command) = {
+            let container = self.containers.get(id)
+                .ok_or_else(|| StoreError::SerializationError(format!("Container {} not found", id)))?;
+            (container.jail_name.clone(), container.command.clone())
+        };
 
         // Start the jail
         self.start_jail(&jail_name)
             .map_err(|e| StoreError::SerializationError(e.to_string()))?;
+
+        // Execute command if specified
+        if let Some(cmd) = command {
+            if !cmd.is_empty() {
+                let jail = self.jails.get(&jail_name)
+                    .ok_or_else(|| StoreError::SerializationError(format!("Jail {} not found", jail_name)))?;
+
+                let (program, args) = cmd.split_first().unwrap_or((&cmd[0], &[]));
+                let args: Vec<String> = args.to_vec();
+
+                info!("Executing command in container {}: {} {:?}", id, program, args);
+
+                // Execute the command in the jail
+                jail.exec(program, &args)
+                    .map_err(|e| StoreError::SerializationError(format!("Failed to execute command: {}", e)))?;
+            }
+        }
 
         // Update state
         if let Some(container) = self.containers.get_mut(id) {
@@ -832,8 +868,11 @@ impl JailManager {
         // Destroy jail
         let _ = self.remove_jail(&container.jail_name);
 
-        // Destroy ZFS dataset
+        // Unmount and destroy ZFS dataset
         if let Some(ref zfs) = self.zfs {
+            // Unmount the dataset first
+            let _ = zfs.unmount_dataset(&container.dataset);
+            // Then destroy it
             let _ = zfs.destroy(&container.dataset);
         }
 

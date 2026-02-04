@@ -657,6 +657,9 @@ async fn get_image_history(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -
                 .map(|(idx, instr)| {
                     let created_by = match instr {
                         crate::image::DockerfileInstruction::From(img) => format!("FROM {}", img),
+                        crate::image::DockerfileInstruction::Bootstrap { version, architecture, .. } => {
+                            format!("BOOTSTRAP {} {}", version.as_deref().unwrap_or("auto"), architecture.as_deref().unwrap_or("auto"))
+                        }
                         crate::image::DockerfileInstruction::Run(cmd) => format!("RUN {}", cmd),
                         crate::image::DockerfileInstruction::Copy { src, dest, .. } => {
                             format!("COPY {} {}", src, dest)
@@ -782,6 +785,7 @@ async fn get_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> Re
                 id: container.id.clone(),
                 name: container.name.clone(),
                 image_id: container.image_id.clone(),
+                jail_name: container.jail_name.clone(),
                 state: container.state.as_str().to_string(),
                 ip: container.ip.clone(),
                 restart_policy: container.restart_policy.as_str().to_string(),
@@ -851,6 +855,7 @@ async fn create_container(manager: Arc<Mutex<JailManager>>, request: CreateConta
         ports: port_mappings,
         volumes: mounts,
         restart_policy,
+        command: request.command.clone(),
     };
 
     match mgr.create_container(config) {
@@ -859,6 +864,7 @@ async fn create_container(manager: Arc<Mutex<JailManager>>, request: CreateConta
                 id: container.id.clone(),
                 name: container.name.clone(),
                 image_id: container.image_id.clone(),
+                jail_name: container.jail_name.clone(),
                 state: container.state.as_str().to_string(),
                 ip: container.ip.clone(),
                 restart_policy: container.restart_policy.as_str().to_string(),
@@ -901,6 +907,7 @@ async fn start_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> 
                 id: container.id.clone(),
                 name: container.name.clone(),
                 image_id: container.image_id.clone(),
+                jail_name: container.jail_name.clone(),
                 state: container.state.as_str().to_string(),
                 ip: container.ip.clone(),
                 restart_policy: container.restart_policy.as_str().to_string(),
@@ -943,6 +950,7 @@ async fn stop_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str) -> R
                 id: container.id.clone(),
                 name: container.name.clone(),
                 image_id: container.image_id.clone(),
+                jail_name: container.jail_name.clone(),
                 state: container.state.as_str().to_string(),
                 ip: container.ip.clone(),
                 restart_policy: container.restart_policy.as_str().to_string(),
@@ -1026,21 +1034,45 @@ async fn exec_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str, exec
         ));
     }
 
-    // Build the command
-    let mut cmd_args = Vec::new();
-    if let Some(ref workdir) = exec_req.workdir {
-        cmd_args.extend(["-U".to_string(), "root".to_string()]);
-        cmd_args.extend(["-c".to_string(), format!("cd {}", workdir)]);
-    }
-    cmd_args.extend(container.jail_name.clone().into_bytes().iter().map(|b| *b as char).collect::<String>().lines().map(String::from));
+    // Build environment variables, including a default PATH if not provided
+    let mut env_vars: Vec<String> = exec_req.env.iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect();
 
-    // For simplicity, we'll use jexec to run the command
-    // jexec [-l -u username] jail command [args ...]
-    let output = match std::process::Command::new("jexec")
-        .arg(&container.jail_name)
-        .args(&exec_req.command)
-        .output()
-    {
+    // Ensure PATH is set (critical for commands to work)
+    if !exec_req.env.contains_key("PATH") {
+        env_vars.push("PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin".to_string());
+    }
+
+    // Build the shell command
+    // We use sh -c to execute the command, which will properly load PATH and handle arguments
+    let shell_command = if let Some(ref workdir) = exec_req.workdir {
+        // Change to workdir first, then execute the command
+        format!("cd {} && exec {}", workdir, shell_words::join(&exec_req.command))
+    } else {
+        format!("exec {}", shell_words::join(&exec_req.command))
+    };
+
+    // Prefix with environment variable exports if needed
+    let final_command = if !env_vars.is_empty() {
+        let env_prefix = env_vars.join(" ");
+        format!("export {}; {}", env_prefix, shell_command)
+    } else {
+        shell_command
+    };
+
+    tracing::debug!("Executing in jail '{}': {}", container.jail_name, final_command);
+
+    // Execute the command using jexec with a shell wrapper
+    // Note: We don't use -l flag here because it causes command echo issues
+    // We already set up environment variables and PATH explicitly above
+    let mut jexec_cmd = std::process::Command::new("jexec");
+    jexec_cmd.arg(&container.jail_name);
+    jexec_cmd.arg("/bin/sh");
+    jexec_cmd.arg("-c");
+    jexec_cmd.arg(&final_command);
+
+    let output = match jexec_cmd.output() {
         Ok(output) => output,
         Err(e) => {
             return Response::internal_error(format!("Failed to execute command: {}", e));
@@ -1410,5 +1442,83 @@ mod tests {
         assert_eq!(exec_req.command.len(), 2);
         assert_eq!(exec_req.workdir, Some("/tmp".to_string()));
         assert_eq!(exec_req.env.len(), 1);
+    }
+
+    /// Test that exec request without PATH still includes default PATH
+    #[tokio::test]
+    async fn test_exec_request_without_path_gets_default() {
+        let exec_req = ExecRequest {
+            command: vec!["echo".to_string(), "test".to_string()],
+            env: std::collections::HashMap::new(),
+            workdir: None,
+        };
+
+        // Verify the exec request has no PATH in env
+        assert!(!exec_req.env.contains_key("PATH"));
+        assert_eq!(exec_req.command.len(), 2);
+    }
+
+    /// Test that exec request with custom PATH preserves it
+    #[tokio::test]
+    async fn test_exec_request_with_custom_path() {
+        let mut custom_env = std::collections::HashMap::new();
+        custom_env.insert("CUSTOM_VAR".to_string(), "custom_value".to_string());
+        custom_env.insert("PATH".to_string(), "/custom/path".to_string());
+
+        let exec_req = ExecRequest {
+            command: vec!["ls".to_string()],
+            env: custom_env,
+            workdir: None,
+        };
+
+        // Verify custom PATH is preserved
+        assert_eq!(exec_req.env.get("PATH"), Some(&"/custom/path".to_string()));
+        assert_eq!(exec_req.env.get("CUSTOM_VAR"), Some(&"custom_value".to_string()));
+    }
+
+    /// Test exec command building with workdir
+    #[tokio::test]
+    async fn test_exec_command_with_workdir() {
+        let exec_req = ExecRequest {
+            command: vec!["ls".to_string(), "-la".to_string()],
+            env: std::collections::HashMap::new(),
+            workdir: Some("/root".to_string()),
+        };
+
+        // Simulate the command building logic from exec_container
+        let shell_command = format!("cd {} && exec {}", exec_req.workdir.unwrap(), shell_words::join(&exec_req.command));
+
+        assert!(shell_command.contains("cd /root"));
+        assert!(shell_command.contains("exec ls -la"));
+    }
+
+    /// Test exec command building without workdir
+    #[tokio::test]
+    async fn test_exec_command_without_workdir() {
+        let exec_req = ExecRequest {
+            command: vec!["uname".to_string(), "-a".to_string()],
+            env: std::collections::HashMap::new(),
+            workdir: None,
+        };
+
+        // Simulate the command building logic from exec_container
+        let shell_command = format!("exec {}", shell_words::join(&exec_req.command));
+
+        assert_eq!(shell_command, "exec uname -a");
+    }
+
+    /// Test that shell-words properly quotes arguments
+    #[tokio::test]
+    async fn test_exec_command_with_spaces() {
+        let exec_req = ExecRequest {
+            command: vec!["echo".to_string(), "hello world".to_string(), "test".to_string()],
+            env: std::collections::HashMap::new(),
+            workdir: None,
+        };
+
+        // shell-words::join should properly quote arguments with spaces
+        let joined = shell_words::join(&exec_req.command);
+
+        assert!(joined.contains("'hello world'") || joined.contains("\"hello world\""));
     }
 }

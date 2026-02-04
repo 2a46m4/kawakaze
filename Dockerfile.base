@@ -2,6 +2,11 @@
 # This is the base layer for all other images
 FROM scratch
 
+# Bootstrap FreeBSD base system
+# Downloads and installs the complete FreeBSD base system
+# Use auto-detection for version and architecture
+BOOTSTRAP
+
 # Set working directory
 WORKDIR /root
 

@@ -4,7 +4,7 @@
 //! zfs and zpool command-line utilities. It supports creating and managing
 //! datasets, snapshots, and clones which are used for jail images and containers.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::string::FromUtf8Error;
 use thiserror::Error;
@@ -144,6 +144,8 @@ impl Zfs {
         let output = Command::new("zfs")
             .arg("create")
             .arg("-p")
+            .arg("-o")
+            .arg("canmount=off")
             .arg(path)
             .output()?;
 
@@ -156,6 +158,136 @@ impl Zfs {
         }
 
         Ok(())
+    }
+
+    /// Mount a dataset to a specific mountpoint
+    pub fn mount_dataset(&self, dataset: &str, mountpoint: &Path) -> Result<()> {
+        let mountpoint_str = mountpoint.to_str()
+            .ok_or_else(|| ZfsError::CommandFailed("Invalid mountpoint path".to_string()))?;
+
+        // Set canmount to noauto so we can control mounting
+        let output = Command::new("zfs")
+            .arg("set")
+            .arg("canmount=noauto")
+            .arg(dataset)
+            .output()?;
+
+        if !output.status.success() {
+            let error_msg = String::from_utf8_lossy(&output.stderr);
+            return Err(ZfsError::CommandFailed(format!(
+                "Failed to set canmount for '{}': {}",
+                dataset, error_msg
+            )));
+        }
+
+        let output = Command::new("zfs")
+            .arg("set")
+            .arg(format!("mountpoint={}", mountpoint_str))
+            .arg(dataset)
+            .output()?;
+
+        if !output.status.success() {
+            let error_msg = String::from_utf8_lossy(&output.stderr);
+            return Err(ZfsError::CommandFailed(format!(
+                "Failed to set mountpoint for '{}': {}",
+                dataset, error_msg
+            )));
+        }
+
+        // Ensure the mountpoint directory exists
+        std::fs::create_dir_all(mountpoint).map_err(|e| ZfsError::CommandFailed(format!("Failed to create mountpoint directory: {}", e)))?;
+
+        // Mount the dataset (ignore error if already mounted)
+        let output = Command::new("zfs")
+            .arg("mount")
+            .arg(dataset)
+            .output()?;
+
+        if !output.status.success() {
+            let error_msg = String::from_utf8_lossy(&output.stderr);
+            // If it's already mounted, that's okay
+            if !error_msg.contains("already mounted") {
+                return Err(ZfsError::CommandFailed(format!(
+                    "Failed to mount '{}': {}",
+                    dataset, error_msg
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Unmount a dataset
+    pub fn unmount_dataset(&self, dataset: &str) -> Result<()> {
+        // Try force unmount first to handle busy filesystems
+        let output = Command::new("zfs")
+            .arg("unmount")
+            .arg("-f")
+            .arg(dataset)
+            .output()?;
+
+        if !output.status.success() {
+            let error_msg = String::from_utf8_lossy(&output.stderr);
+            return Err(ZfsError::CommandFailed(format!(
+                "Failed to unmount '{}': {}",
+                dataset, error_msg
+            )));
+        }
+
+        // Reset mountpoint to none
+        let output = Command::new("zfs")
+            .arg("set")
+            .arg("mountpoint=none")
+            .arg(dataset)
+            .output()?;
+
+        if !output.status.success() {
+            let error_msg = String::from_utf8_lossy(&output.stderr);
+            return Err(ZfsError::CommandFailed(format!(
+                "Failed to reset mountpoint for '{}': {}",
+                dataset, error_msg
+            )));
+        }
+
+        // Reset canmount to off
+        let output = Command::new("zfs")
+            .arg("set")
+            .arg("canmount=off")
+            .arg(dataset)
+            .output()?;
+
+        if !output.status.success() {
+            let error_msg = String::from_utf8_lossy(&output.stderr);
+            return Err(ZfsError::CommandFailed(format!(
+                "Failed to reset canmount for '{}': {}",
+                dataset, error_msg
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Check if a dataset is currently mounted
+    fn is_dataset_mounted(&self, dataset: &str) -> bool {
+        let output = Command::new("zfs")
+            .arg("list")
+            .arg("-H")
+            .arg("-o")
+            .arg("mounted")
+            .arg(dataset)
+            .output();
+
+        match output {
+            Ok(out) => {
+                if out.status.success() {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    stdout.trim() == "yes"
+                } else {
+                    false
+                }
+            }
+            Err(_) => false,
+        }
     }
 
     /// Create a ZFS snapshot of a dataset

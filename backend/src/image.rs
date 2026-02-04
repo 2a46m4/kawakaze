@@ -45,6 +45,7 @@ impl std::str::FromStr for ImageState {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DockerfileInstruction {
     From(String),
+    Bootstrap { version: Option<String>, architecture: Option<String>, mirror: Option<String> },
     Run(String),
     Copy { from: Option<String>, src: String, dest: String },
     Add { src: String, dest: String },

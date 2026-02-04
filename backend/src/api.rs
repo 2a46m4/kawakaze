@@ -619,6 +619,8 @@ pub struct ContainerInfo {
     pub name: Option<String>,
     /// Image ID the container is running
     pub image_id: String,
+    /// Jail name (internal identifier used by FreeBSD)
+    pub jail_name: String,
     /// Container state
     pub state: String,
     /// Container IP address (if running)
@@ -966,6 +968,7 @@ mod tests {
             id: "container-1".to_string(),
             name: Some("webserver".to_string()),
             image_id: "abc123".to_string(),
+            jail_name: "kawakaze-container-1".to_string(),
             state: "running".to_string(),
             ip: Some("10.11.0.2".to_string()),
             restart_policy: "on-restart".to_string(),

@@ -240,6 +240,9 @@ pub struct ContainerConfig {
     /// Restart policy
     #[serde(default)]
     pub restart_policy: RestartPolicy,
+    /// Command to run (overrides image's CMD/ENTRYPOINT)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
 }
 
 /// Represents a container (running jail instance)
@@ -255,6 +258,8 @@ pub struct Container {
     pub mounts: Vec<Mount>,
     pub port_mappings: Vec<PortMapping>,
     pub ip: Option<String>,
+    /// Command to run (overrides image's CMD/ENTRYPOINT)
+    pub command: Option<Vec<String>>,
     pub created_at: i64,
     pub started_at: Option<i64>,
 }
@@ -273,6 +278,7 @@ impl Container {
             mounts: Vec::new(),
             port_mappings: Vec::new(),
             ip: None,
+            command: None,
             created_at: chrono::Utc::now().timestamp(),
             started_at: None,
         }
@@ -292,6 +298,7 @@ impl Container {
             mounts: Vec::new(),
             port_mappings: Vec::new(),
             ip: None,
+            command: None,
             created_at: chrono::Utc::now().timestamp(),
             started_at: None,
         }
@@ -309,6 +316,7 @@ impl Container {
         mounts: Vec<Mount>,
         port_mappings: Vec<PortMapping>,
         ip: Option<String>,
+        command: Option<Vec<String>>,
         created_at: i64,
         started_at: Option<i64>,
     ) -> Self {
@@ -323,6 +331,7 @@ impl Container {
             mounts,
             port_mappings,
             ip,
+            command,
             created_at,
             started_at,
         }
@@ -360,6 +369,12 @@ impl Container {
     /// Adds a port mapping to the container
     pub fn with_port_mapping(mut self, mapping: PortMapping) -> Self {
         self.port_mappings.push(mapping);
+        self
+    }
+
+    /// Sets the command to run (overrides image's CMD/ENTRYPOINT)
+    pub fn with_command(mut self, command: Vec<String>) -> Self {
+        self.command = Some(command);
         self
     }
 
@@ -602,6 +617,32 @@ mod tests {
     }
 
     #[test]
+    fn test_container_with_command() {
+        let command = vec!["sh".to_string(), "-c".to_string(), "echo hello".to_string()];
+
+        let container = Container::new(
+            "image-123".to_string(),
+            "jail-test".to_string(),
+            "zroot/jails/test".to_string(),
+        )
+        .with_command(command.clone());
+
+        assert_eq!(container.command, Some(command));
+    }
+
+    #[test]
+    fn test_container_without_command() {
+        let container = Container::new(
+            "image-123".to_string(),
+            "jail-test".to_string(),
+            "zroot/jails/test".to_string(),
+        );
+
+        // New containers should have no command by default
+        assert_eq!(container.command, None);
+    }
+
+    #[test]
     fn test_container_set_state() {
         let mut container = Container::new(
             "image-123".to_string(),
@@ -680,7 +721,8 @@ mod tests {
         )
         .with_name("test-container".to_string())
         .with_ip("10.11.0.2".to_string())
-        .with_restart_policy(RestartPolicy::Always);
+        .with_restart_policy(RestartPolicy::Always)
+        .with_command(vec!["sh".to_string(), "-c".to_string(), "echo hello".to_string()]);
 
         let json = serde_json::to_string(&container).unwrap();
         let deserialized: Container = serde_json::from_str(&json).unwrap();
@@ -693,5 +735,6 @@ mod tests {
         assert_eq!(deserialized.state, container.state);
         assert_eq!(deserialized.restart_policy, container.restart_policy);
         assert_eq!(deserialized.ip, container.ip);
+        assert_eq!(deserialized.command, container.command);
     }
 }

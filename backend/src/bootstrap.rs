@@ -267,8 +267,8 @@ impl Bootstrap {
         // Build cache key
         let cache_key = format!("{}-{}", version, architecture);
 
-        // Check cache first
-        let tarball_path = if !self.config.no_cache {
+        // Try to use cached tarball, but fall back to download if extraction fails
+        let mut tarball_path = if !self.config.no_cache {
             if let Some(ref cache) = self.cache {
                 if let Some(cached) = cache.get(&cache_key) {
                     info!("Using cached tarball: {:?}", cached);
@@ -283,15 +283,37 @@ impl Bootstrap {
             self.download_and_verify(&version, &architecture).await?
         };
 
-        // Store in cache
-        if !self.config.no_cache {
-            if let Some(ref cache) = self.cache {
-                let _ = cache.put(&cache_key, &tarball_path).await;
+        // Try extracting, but invalidate cache and retry on failure
+        let using_cached = self.cache.as_ref().is_some()
+            && self.cache.as_ref().and_then(|c| c.get(&cache_key)).is_some();
+
+        match self.extract_tarball(&tarball_path).await {
+            Ok(_) => {
+                // Store in cache if we just downloaded it
+                if !self.config.no_cache {
+                    if let Some(ref cache) = self.cache {
+                        let _ = cache.put(&cache_key, &tarball_path).await;
+                    }
+                }
+            }
+            Err(e) => {
+                // If we were using a cached file, invalidate it and retry
+                if using_cached && !self.config.no_cache {
+                    info!("Cached tarball appears corrupted, invalidating cache and retrying...");
+                    if let Some(ref cache) = self.cache {
+                        cache.invalidate(&cache_key).await?;
+                    }
+                    tarball_path = self.download_and_verify(&version, &architecture).await?;
+                    self.extract_tarball(&tarball_path).await?;
+                    // Store the fresh download in cache
+                    if let Some(ref cache) = self.cache {
+                        let _ = cache.put(&cache_key, &tarball_path).await;
+                    }
+                } else {
+                    return Err(e);
+                }
             }
         }
-
-        // Extract tarball
-        self.extract_tarball(&tarball_path).await?;
 
         // Create configuration files
         self.create_config_files().await?;
@@ -321,6 +343,10 @@ impl Bootstrap {
             if unsafe { libc::uname(&mut utsname) } == 0 {
                 let release = unsafe { CStr::from_ptr(utsname.release.as_ptr()) };
                 if let Ok(s) = release.to_str() {
+                    // Check if it already ends with -RELEASE
+                    if s.ends_with("-RELEASE") {
+                        return Ok(s.to_string());
+                    }
                     // Convert "15.0" to "15.0-RELEASE"
                     return Ok(format!("{}-RELEASE", s));
                 }
@@ -395,7 +421,7 @@ impl Bootstrap {
         architecture: &str,
     ) -> Result<PathBuf, BootstrapError> {
         let tarball_url = self.build_mirror_url(version, architecture, "base.txz");
-        let checksum_url = self.build_mirror_url(version, architecture, "base.txz.sha256");
+        let manifest_url = self.build_mirror_url(version, architecture, "MANIFEST");
 
         info!("Downloading from: {}", tarball_url);
 
@@ -414,8 +440,8 @@ impl Bootstrap {
             "Verifying checksum...",
         );
 
-        // Download checksum
-        let expected_checksum = self.download_checksum(&checksum_url).await?;
+        // Download checksum from MANIFEST
+        let expected_checksum = self.download_checksum_from_manifest(&manifest_url).await?;
 
         // Verify checksum
         self.verify_checksum(&tarball_path, &expected_checksum).await?;
@@ -478,8 +504,8 @@ impl Bootstrap {
         Ok(temp_path)
     }
 
-    /// Download checksum file
-    async fn download_checksum(&self, url: &str) -> Result<String, BootstrapError> {
+    /// Download checksum from MANIFEST file
+    async fn download_checksum_from_manifest(&self, url: &str) -> Result<String, BootstrapError> {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?;
@@ -488,22 +514,25 @@ impl Bootstrap {
 
         if !response.status().is_success() {
             return Err(BootstrapError::DownloadFailed(format!(
-                "Failed to download checksum: HTTP {}",
+                "Failed to download MANIFEST: HTTP {}",
                 response.status()
             )));
         }
 
         let content = response.text().await?;
 
-        // Parse checksum (format: "HASH  base.txz")
-        let parts: Vec<&str> = content.split_whitespace().collect();
-        if parts.is_empty() {
-            return Err(BootstrapError::DownloadFailed(
-                "Invalid checksum format".to_string(),
-            ));
+        // Parse MANIFEST file (tab-separated format: filename\thash\tsize\t...)
+        // We're looking for the line that starts with "base.txz"
+        for line in content.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() >= 2 && parts[0] == "base.txz" {
+                return Ok(parts[1].to_string());
+            }
         }
 
-        Ok(parts[0].to_string())
+        Err(BootstrapError::DownloadFailed(
+            "base.txz not found in MANIFEST".to_string(),
+        ))
     }
 
     /// Verify SHA256 checksum
@@ -578,6 +607,10 @@ impl Bootstrap {
         let etc_dir = self.jail_path.join("etc");
         fs::create_dir_all(&etc_dir).await?;
 
+        // Create root home directory
+        let root_home = self.jail_path.join("root");
+        fs::create_dir_all(&root_home).await?;
+
         // Apply custom overrides if provided
         if let Some(ref overrides) = self.config.config_overrides {
             for (path, content) in overrides {
@@ -592,6 +625,9 @@ impl Bootstrap {
             self.create_default_rc_conf(&etc_dir).await?;
             self.create_default_resolv_conf(&etc_dir).await?;
             self.create_default_hosts(&etc_dir).await?;
+            self.create_default_profile(&etc_dir).await?;
+            self.create_default_root_profile(&root_home).await?;
+            self.create_default_cshrc(&root_home).await?;
         }
 
         self.report_progress(
@@ -641,6 +677,81 @@ nameserver 8.8.8.8
         );
 
         fs::write(etc_dir.join("hosts"), content).await?;
+        Ok(())
+    }
+
+    /// Create default /etc/profile with PATH for sh/bash shells
+    async fn create_default_profile(&self, etc_dir: &Path) -> Result<(), BootstrapError> {
+        let content = r#"# System-wide .profile for sh(1) and bash(1)
+
+# Set default PATH
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:~/bin
+export PATH
+
+# Set default block size for ls, df, du
+BLOCKSIZE=K; export BLOCKSIZE
+
+# Set default terminal type
+TERM=${TERM:-xterm}; export TERM
+
+# Display date on login
+[ -x /bin/date ] && echo "Welcome to `uname -sr` on `date`"
+
+# Set umask
+umask 022
+"#;
+
+        fs::write(etc_dir.join("profile"), content).await?;
+        Ok(())
+    }
+
+    /// Create default .profile for root user
+    async fn create_default_root_profile(&self, root_home: &Path) -> Result<(), BootstrapError> {
+        let content = r#"# Root user profile
+
+# Set PATH for root
+PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:~/bin
+export PATH
+
+# Useful aliases
+alias ls='ls -G'
+alias ll='ls -alG'
+alias df='df -h'
+alias du='du -h'
+
+# Set a more informative prompt
+PS1='\u@\h:\w\$ '
+export PS1
+"#;
+
+        fs::write(root_home.join(".profile"), content).await?;
+        Ok(())
+    }
+
+    /// Create default .cshrc for root user (csh/tcsh)
+    async fn create_default_cshrc(&self, root_home: &Path) -> Result<(), BootstrapError> {
+        let content = r#"# Root user cshrc
+
+# Set PATH for csh/tcsh
+set path = (/sbin /bin /usr/sbin /usr/bin /usr/local/sbin /usr/local/bin ~/bin)
+
+# Set default block size
+setenv BLOCKSIZE K
+
+# Set terminal type
+if ( ! $?TERM ) setenv TERM xterm
+
+# Useful aliases
+alias ls 'ls -G'
+alias ll 'ls -alG'
+alias df 'df -h'
+alias du 'du -h'
+
+# Set a more informative prompt
+set prompt = '%n@%m:%~%# '
+"#;
+
+        fs::write(root_home.join(".cshrc"), content).await?;
         Ok(())
     }
 

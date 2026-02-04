@@ -6,6 +6,7 @@
 
 use crate::image::{Image, ImageConfig, DockerfileInstruction, ImageId};
 use crate::zfs::Zfs;
+use crate::bootstrap::{Bootstrap, BootstrapConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -124,79 +125,80 @@ impl ImageBuilder {
         let build_dataset = format!("{}/build-{}", self.base_dataset, name);
         self.create_build_dataset(&build_dataset, from_image)?;
 
-        let mountpoint = self.zfs.get_mountpoint(&build_dataset)
+        // Mount the build dataset to a temporary location for building
+        let build_mountpoint = PathBuf::from(format!("/var/db/kawakaze/builds/{}", name.replace('/', "-")));
+        self.zfs.mount_dataset(&build_dataset, &build_mountpoint)
             .map_err(|e| ImageError::Zfs(e.to_string()))?;
 
         // Execute instructions
-        for (step, instruction) in instructions.iter().enumerate() {
-            self.report_progress(
-                &name,
-                step,
-                total_steps,
-                instruction,
-                BuildStatus::Building
-            ).await;
+        let build_result = (|| async {
+            let mut config = from_image.map(|i| i.config.clone()).unwrap_or_default();
+            let parent_id = from_image.map(|i| i.id.clone());
 
-            if let Err(e) = self.execute_instruction(&mountpoint, instruction, &mut config).await {
-                error!("Build failed at step {}: {}", step, e);
-
-                // Clean up build dataset on failure
-                let _ = self.zfs.destroy(&build_dataset);
-
+            // Execute instructions
+            for (step, instruction) in instructions.iter().enumerate() {
                 self.report_progress(
                     &name,
                     step,
                     total_steps,
                     instruction,
-                    BuildStatus::Failed
+                    BuildStatus::Building
                 ).await;
 
-                return Err(e);
+                if let Err(e) = self.execute_instruction(&build_mountpoint, instruction, &mut config).await {
+                    error!("Build failed at step {}: {}", step, e);
+                    return Err(e);
+                }
             }
-        }
 
-        // Create snapshot of the final image
-        let snapshot_name = format!("{}-{}", name.replace('/', "-"), uuid::Uuid::new_v4());
-        self.zfs.create_snapshot(&build_dataset, &snapshot_name)
-            .map_err(|e| ImageError::Zfs(e.to_string()))?;
+            // Create snapshot of the final image
+            let snapshot_name = format!("{}-{}", name.replace('/', "-"), uuid::Uuid::new_v4());
+            self.zfs.create_snapshot(&build_dataset, &snapshot_name)
+                .map_err(|e| ImageError::Zfs(e.to_string()))?;
 
-        let snapshot = format!("{}@{}", build_dataset, snapshot_name);
+            let snapshot = format!("{}@{}", build_dataset, snapshot_name);
 
-        // Get image size
-        let size_bytes = match self.zfs.get_used_space(&build_dataset) {
-            Ok(size) => size,
-            Err(_) => 0,
-        };
+            // Get image size
+            let size_bytes = match self.zfs.get_used_space(&build_dataset) {
+                Ok(size) => size,
+                Err(_) => 0,
+            };
 
-        // Rename build dataset to final image dataset
-        let final_dataset = format!("{}/{}", self.base_dataset, name.replace('/', "-"));
-        self.zfs.rename(&build_dataset, &final_dataset)
-            .map_err(|e| ImageError::Zfs(e.to_string()))?;
+            // Rename build dataset to final image dataset
+            let final_dataset = format!("{}/{}", self.base_dataset, name.replace('/', "-"));
+            self.zfs.rename(&build_dataset, &final_dataset)
+                .map_err(|e| ImageError::Zfs(e.to_string()))?;
 
-        let final_snapshot = format!("{}@{}", final_dataset, snapshot_name);
+            let final_snapshot = format!("{}@{}", final_dataset, snapshot_name);
 
-        // Create image - only set parent_id if we have a base image
-        let mut image = Image::new(name, instructions)
-            .with_snapshot(final_snapshot)
-            .with_config(config)
-            .with_size(size_bytes)
-            .with_state(crate::image::ImageState::Available);
+            // Create image - only set parent_id if we have a base image
+            let mut image = Image::new(name, instructions)
+                .with_snapshot(final_snapshot)
+                .with_config(config)
+                .with_size(size_bytes)
+                .with_state(crate::image::ImageState::Available);
 
-        // Set parent_id only if building from a base image
-        if let Some(pid) = parent_id {
-            image = image.with_parent(pid);
-        }
+            // Set parent_id only if building from a base image
+            if let Some(pid) = parent_id {
+                image = image.with_parent(pid);
+            }
 
-        self.report_progress(
-            &image.id,
-            total_steps,
-            total_steps,
-            &DockerfileInstruction::Run("complete".to_string()),
-            BuildStatus::Complete
-        ).await;
+            self.report_progress(
+                &image.id,
+                total_steps,
+                total_steps,
+                &DockerfileInstruction::Run("complete".to_string()),
+                BuildStatus::Complete
+            ).await;
 
-        info!("Image build completed successfully: {}", image.id);
-        Ok(image)
+            info!("Image build completed successfully: {}", image.id);
+            Ok::<Image, ImageError>(image)
+        })().await;
+
+        // Unmount the build dataset
+        let _ = self.zfs.unmount_dataset(&build_dataset);
+
+        build_result
     }
 
     /// Parse a Dockerfile into instructions
@@ -263,6 +265,27 @@ impl ImageBuilder {
 
         match instruction.as_str() {
             "FROM" => Ok(DockerfileInstruction::From(args.to_string())),
+
+            "BOOTSTRAP" => {
+                // Parse BOOTSTRAP [VERSION] [ARCHITECTURE] [MIRROR]
+                let parts: Vec<&str> = args.split_whitespace().collect();
+                let version = if parts.len() > 0 && !parts[0].is_empty() {
+                    Some(parts[0].to_string())
+                } else {
+                    None
+                };
+                let architecture = if parts.len() > 1 && !parts[1].is_empty() {
+                    Some(parts[1].to_string())
+                } else {
+                    None
+                };
+                let mirror = if parts.len() > 2 && !parts[2].is_empty() {
+                    Some(parts[2].to_string())
+                } else {
+                    None
+                };
+                Ok(DockerfileInstruction::Bootstrap { version, architecture, mirror })
+            }
 
             "RUN" => Ok(DockerfileInstruction::Run(args.to_string())),
 
@@ -429,6 +452,11 @@ impl ImageBuilder {
                 debug!("FROM instruction (already handled)");
             }
 
+            DockerfileInstruction::Bootstrap { version, architecture, mirror } => {
+                info!("Executing BOOTSTRAP: version={:?}, arch={:?}", version, architecture);
+                self.execute_bootstrap(root, version.clone(), architecture.clone(), mirror.clone()).await?;
+            }
+
             DockerfileInstruction::Run(cmd) => {
                 info!("Executing RUN: {}", cmd);
                 self.execute_run(root, cmd).await?;
@@ -584,6 +612,45 @@ impl ImageBuilder {
         }
     }
 
+    /// Execute a BOOTSTRAP instruction to install FreeBSD base system
+    async fn execute_bootstrap(
+        &mut self,
+        root: &Path,
+        version: Option<String>,
+        architecture: Option<String>,
+        mirror: Option<String>,
+    ) -> Result<()> {
+        info!("Bootstrapping FreeBSD base system at {:?}", root);
+
+        // Check if already bootstrapped
+        if Bootstrap::is_bootstrapped(root) {
+            info!("Already bootstrapped, skipping");
+            return Ok(());
+        }
+
+        // Create bootstrap config
+        let config = BootstrapConfig {
+            version,
+            architecture,
+            mirror,
+            no_cache: false,
+            config_overrides: None,
+        };
+
+        // Create progress channel
+        let (progress_tx, _progress_rx) = tokio::sync::mpsc::channel(100);
+
+        // Create and run bootstrap
+        let bootstrap = Bootstrap::new(root, config, progress_tx)
+            .map_err(|e| ImageError::BuildFailed(format!("Failed to create bootstrap: {}", e)))?;
+
+        bootstrap.run().await
+            .map_err(|e| ImageError::BuildFailed(format!("Bootstrap failed: {}", e)))?;
+
+        info!("Bootstrap completed successfully");
+        Ok(())
+    }
+
     /// Execute a COPY instruction
     fn execute_copy(&self, root: &Path, src: &str, dest: &str) -> Result<()> {
         let src_path = self.build_context.join(src);
@@ -676,6 +743,9 @@ impl ImageBuilder {
     async fn report_progress(&self, image_id: &str, step: usize, total: usize, instruction: &DockerfileInstruction, status: BuildStatus) {
         let current_instruction = match instruction {
             DockerfileInstruction::From(img) => format!("FROM {}", img),
+            DockerfileInstruction::Bootstrap { version, architecture, .. } => {
+                format!("BOOTSTRAP {} {}", version.as_deref().unwrap_or("auto"), architecture.as_deref().unwrap_or("auto"))
+            }
             DockerfileInstruction::Run(cmd) => format!("RUN {}", cmd),
             DockerfileInstruction::Copy { src, dest, .. } => format!("COPY {} {}", src, dest),
             DockerfileInstruction::Add { src, dest } => format!("ADD {} {}", src, dest),

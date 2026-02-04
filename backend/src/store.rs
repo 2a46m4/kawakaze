@@ -136,6 +136,7 @@ pub struct Container {
     pub mounts: String,       // JSON serialized array of Mount
     pub port_mappings: String, // JSON serialized array of PortMapping
     pub ip: Option<String>,
+    pub command: Option<String>, // JSON serialized array of command strings
     pub created_at: i64,
     pub started_at: Option<i64>,
 }
@@ -268,6 +269,7 @@ impl JailStore {
                 mounts TEXT NOT NULL,
                 port_mappings TEXT NOT NULL,
                 ip TEXT,
+                command TEXT,
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                 started_at INTEGER,
                 FOREIGN KEY (image_id) REFERENCES images(id) ON DELETE RESTRICT
@@ -566,8 +568,8 @@ impl JailStore {
         let conn = Connection::open(&self.db_path)?;
 
         conn.execute(
-            "INSERT INTO containers (id, name, image_id, jail_name, dataset, state, restart_policy, mounts, port_mappings, ip, created_at, started_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO containers (id, name, image_id, jail_name, dataset, state, restart_policy, mounts, port_mappings, ip, command, created_at, started_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 &container.id,
                 &container.name,
@@ -579,6 +581,7 @@ impl JailStore {
                 &container.mounts,
                 &container.port_mappings,
                 &container.ip,
+                &container.command,
                 &container.created_at,
                 &container.started_at,
             ],
@@ -593,7 +596,7 @@ impl JailStore {
         let conn = Connection::open(&self.db_path)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, name, image_id, jail_name, dataset, state, restart_policy, mounts, port_mappings, ip, created_at, started_at
+            "SELECT id, name, image_id, jail_name, dataset, state, restart_policy, mounts, port_mappings, ip, command, created_at, started_at
              FROM containers WHERE id = ?1"
         )?;
 
@@ -612,8 +615,9 @@ impl JailStore {
                 mounts: row.get(7)?,
                 port_mappings: row.get(8)?,
                 ip: row.get(9)?,
-                created_at: row.get(10)?,
-                started_at: row.get(11)?,
+                command: row.get(10)?,
+                created_at: row.get(11)?,
+                started_at: row.get(12)?,
             })
         })?;
 
@@ -629,7 +633,7 @@ impl JailStore {
         let conn = Connection::open(&self.db_path)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, name, image_id, jail_name, dataset, state, restart_policy, mounts, port_mappings, ip, created_at, started_at
+            "SELECT id, name, image_id, jail_name, dataset, state, restart_policy, mounts, port_mappings, ip, command, created_at, started_at
              FROM containers WHERE name = ?1"
         )?;
 
@@ -648,8 +652,9 @@ impl JailStore {
                 mounts: row.get(7)?,
                 port_mappings: row.get(8)?,
                 ip: row.get(9)?,
-                created_at: row.get(10)?,
-                started_at: row.get(11)?,
+                command: row.get(10)?,
+                created_at: row.get(11)?,
+                started_at: row.get(12)?,
             })
         })?;
 
@@ -665,7 +670,7 @@ impl JailStore {
         let conn = Connection::open(&self.db_path)?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, name, image_id, jail_name, dataset, state, restart_policy, mounts, port_mappings, ip, created_at, started_at
+            "SELECT id, name, image_id, jail_name, dataset, state, restart_policy, mounts, port_mappings, ip, command, created_at, started_at
              FROM containers"
         )?;
 
@@ -684,8 +689,9 @@ impl JailStore {
                 mounts: row.get(7)?,
                 port_mappings: row.get(8)?,
                 ip: row.get(9)?,
-                created_at: row.get(10)?,
-                started_at: row.get(11)?,
+                command: row.get(10)?,
+                created_at: row.get(11)?,
+                started_at: row.get(12)?,
             })
         })?;
 

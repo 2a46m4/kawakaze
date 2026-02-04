@@ -5,6 +5,7 @@
 use std::ffi::{CString, NulError};
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 /// Represents a FreeBSD jail
 pub struct Jail {
@@ -99,7 +100,14 @@ impl Jail {
 
         #[cfg(target_os = "freebsd")]
         {
+            // Get the jail path for devfs mounting
+            let jail_path = self.path.clone().unwrap_or_else(|| format!("/tmp/{}", self.name));
+
             self.jid = create_freebsd_jail(&self.name, self.path.as_deref(), self.ip.as_deref())?;
+
+            // Mount devfs inside the jail for device access (needed by commands like top)
+            mount_devfs(&self.name, &jail_path)?;
+
             self.state = JailState::Running;
             return Ok(());
         }
@@ -131,6 +139,12 @@ impl Jail {
 
         #[cfg(target_os = "freebsd")]
         {
+            // Get the jail path for devfs unmounting
+            let jail_path = self.path.clone().unwrap_or_else(|| format!("/tmp/{}", self.name));
+
+            // Unmount devfs before removing the jail
+            let _ = unmount_devfs(&jail_path); // Ignore errors, devfs might not be mounted
+
             remove_freebsd_jail(self.jid)?;
             self.jid = -1;
             self.state = JailState::Stopped;
@@ -184,6 +198,58 @@ impl Jail {
         #[cfg(not(target_os = "freebsd"))]
         {
             false
+        }
+    }
+
+    /// Execute a command inside the jail
+    ///
+    /// This runs the specified command with arguments inside the running jail using jexec.
+    /// The PATH environment variable is set to ensure commands work correctly.
+    pub fn exec(&self, command: &str, args: &[String]) -> Result<(), JailError> {
+        if self.state != JailState::Running {
+            return Err(JailError::StartFailed(format!(
+                "Jail '{}' is not running", self.name
+            )));
+        }
+
+        #[cfg(target_os = "freebsd")]
+        {
+            // Build the jexec command
+            // jexec <jail_name> env PATH=/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:~/bin <command> <args...>
+            let mut cmd = Command::new("jexec");
+            cmd.arg(&self.name);
+
+            // Set PATH environment variable for command execution
+            cmd.env("PATH", "/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin:~/bin");
+
+            cmd.arg(command);
+            cmd.args(args);
+
+            // Execute the command and wait for it to complete
+            let output = cmd.output()
+                .map_err(|e| JailError::StartFailed(format!(
+                    "Failed to execute jexec: {}", e
+                )))?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                return Err(JailError::StartFailed(format!(
+                    "Command failed in jail '{}': {}{}",
+                    self.name,
+                    stdout,
+                    if !stderr.is_empty() { format!("\n{}", stderr) } else { String::new() }
+                )));
+            }
+
+            Ok(())
+        }
+
+        #[cfg(not(target_os = "freebsd"))]
+        {
+            Err(JailError::StartFailed(
+                "jexec is only supported on FreeBSD".into()
+            ))
         }
     }
 }
@@ -487,10 +553,87 @@ mod freebsd {
 
         result >= 0
     }
+
+    /// Mount devfs inside a jail
+    ///
+    /// This mounts the devfs filesystem at /dev inside the jail path,
+    /// which is necessary for commands like `top` to access device nodes.
+    pub fn mount_devfs(jail_name: &str, jail_path: &str) -> Result<(), JailError> {
+        // Create /dev directory if it doesn't exist
+        let dev_path = format!("{}/dev", jail_path);
+        if let Err(e) = fs::create_dir_all(&dev_path) {
+            return Err(JailError::CreationFailed(format!(
+                "Failed to create /dev directory in jail '{}': {}",
+                jail_name, e
+            )));
+        }
+
+        // Mount devfs using the mount command
+        // On FreeBSD, the correct syntax is: mount -t devfs devfs /path
+        // We can also use -o to specify options like ruleset
+        let output = Command::new("mount")
+            .arg("-t")
+            .arg("devfs")
+            .arg("devfs")
+            .arg(&dev_path)
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                Err(JailError::CreationFailed(format!(
+                    "Failed to mount devfs in jail '{}': {}",
+                    jail_name, stderr
+                )))
+            }
+            Err(e) => {
+                Err(JailError::CreationFailed(format!(
+                    "Failed to execute mount command for jail '{}': {}",
+                    jail_name, e
+                )))
+            }
+        }
+    }
+
+    /// Unmount devfs from a jail
+    ///
+    /// This unmounts the devfs filesystem from the jail path.
+    /// Silently succeeds if devfs is not mounted.
+    pub fn unmount_devfs(jail_path: &str) -> Result<(), JailError> {
+        let dev_path = format!("{}/dev", jail_path);
+
+        // Unmount devfs using the umount command with -f to force unmount
+        let output = Command::new("umount")
+            .arg("-f")
+            .arg(&dev_path)
+            .output();
+
+        match output {
+            Ok(output) if output.status.success() => Ok(()),
+            Ok(output) => {
+                // Check if the error is because it's not mounted
+                // In that case, we silently succeed
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                if stderr.contains("not mounted") || stderr.contains("not found") {
+                    Ok(())
+                } else {
+                    tracing::debug!("Failed to unmount devfs from '{}': {}", dev_path, stderr);
+                    // Don't fail if unmount fails - it might already be unmounted
+                    Ok(())
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Failed to execute umount command for '{}': {}", dev_path, e);
+                // Don't fail - it might already be unmounted
+                Ok(())
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "freebsd")]
-use freebsd::{create_freebsd_jail, remove_freebsd_jail, check_jail_exists};
+use freebsd::{create_freebsd_jail, remove_freebsd_jail, check_jail_exists, mount_devfs, unmount_devfs};
 
 #[cfg(test)]
 mod tests {
@@ -701,5 +844,46 @@ mod tests {
 
         let info = jail.info();
         assert_eq!(info.path, Some("/tmp/custom_path".to_string()));
+    }
+
+    #[test]
+    fn test_jail_exec_nonexistent_jail() {
+        let jail = Jail::create("test_exec_nonexistent").unwrap();
+
+        // Try to exec in a jail that isn't running
+        let result = jail.exec("echo", &["hello".to_string()]);
+        assert!(result.is_err());
+
+        match result {
+            Err(JailError::StartFailed(msg)) => {
+                assert!(msg.contains("not running") || msg.contains("failed"));
+            }
+            _ => panic!("Expected StartFailed error"),
+        }
+    }
+
+    #[test]
+    fn test_jail_exec_empty_command() {
+        let jail = Jail::create("test_exec_empty").unwrap();
+
+        let result = jail.exec("", &[]);
+        assert!(result.is_err());
+
+        match result {
+            Err(JailError::StartFailed(msg)) => {
+                assert!(msg.contains("empty") || msg.contains("not running"));
+            }
+            _ => panic!("Expected StartFailed error"),
+        }
+    }
+
+    #[test]
+    fn test_jail_exec_with_args() {
+        let jail = Jail::create("test_exec_args").unwrap();
+
+        // Just test that the method accepts args properly
+        // Actual execution will fail since jail isn't running
+        let result = jail.exec("echo", &["hello".to_string(), "world".to_string()]);
+        assert!(result.is_err());
     }
 }

@@ -197,6 +197,16 @@ impl JailStore {
 
     /// Initialize the database schema
     fn init_db(&self) -> Result<(), StoreError> {
+        // Ensure parent directory exists before opening database
+        if let Some(parent) = self.db_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                StoreError::DatabaseError(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                    Some(format!("Failed to create database directory: {}", e)),
+                ))
+            })?;
+        }
+
         let conn = Connection::open(&self.db_path)?;
 
         // Create jails table
@@ -851,5 +861,64 @@ mod tests {
 
         let result = store.insert_jail(&jail);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_database_creates_parent_directory() {
+        // Test that database can be created when parent directory doesn't exist
+        let test_dir = format!("/tmp/test_kawakaze_nested_{}", std::process::id());
+        let test_db = format!("{}/nested/db/kawakaze.db", test_dir);
+
+        // Ensure the directory doesn't exist
+        let _ = std::fs::remove_dir_all(&test_dir);
+
+        // This should succeed by creating the parent directory
+        let result = JailStore::new(&test_db);
+        assert!(result.is_ok(), "Failed to create database with non-existent parent directory: {:?}", result.err());
+
+        let store = result.unwrap();
+        assert!(store.db_path().exists());
+
+        // Verify we can insert and query data
+        let jail = JailRow {
+            name: "test_jail".to_string(),
+            path: Some("/tmp/test".to_string()),
+            ip: Some("192.168.1.1".to_string()),
+            state: "created".to_string(),
+            jid: -1,
+        };
+
+        store.insert_jail(&jail).unwrap();
+        let retrieved = store.get_jail("test_jail").unwrap().unwrap();
+        assert_eq!(retrieved.name, "test_jail");
+
+        // Clean up
+        drop(store);
+        std::fs::remove_dir_all(&test_dir).ok();
+    }
+
+    #[test]
+    fn test_database_creates_deep_nested_directory() {
+        // Test that database can be created with deeply nested directories
+        let test_dir = format!("/tmp/test_kawakaze_deep_{}", std::process::id());
+        let test_db = format!("{}/a/b/c/d/e/f/g/kawakaze.db", test_dir);
+
+        // Ensure the directory doesn't exist
+        let _ = std::fs::remove_dir_all(&test_dir);
+
+        // This should succeed by creating all parent directories
+        let result = JailStore::new(&test_db);
+        assert!(result.is_ok(), "Failed to create database with deeply nested parent directory: {:?}", result.err());
+
+        let store = result.unwrap();
+        assert!(store.db_path().exists());
+
+        // Verify the database works
+        let all_jails = store.get_all_jails().unwrap();
+        assert_eq!(all_jails.len(), 0);
+
+        // Clean up
+        drop(store);
+        std::fs::remove_dir_all(&test_dir).ok();
     }
 }

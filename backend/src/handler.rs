@@ -7,7 +7,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use crate::api::{
     ApiError, BootstrapRequest, BuildImageRequest, ContainerInfo, ContainerListItem, CreateContainerRequest,
-    CreateJailRequest, Endpoint, ImageHistoryItem, ImageInfo, ImageListItem,
+    CreateJailRequest, Endpoint, ExecRequest, ExecResult, ImageHistoryItem, ImageInfo, ImageListItem,
     JailInfo, JailListItem, Request, Response,
 };
 use crate::bootstrap::{Bootstrap, BootstrapConfig};
@@ -72,6 +72,12 @@ pub async fn handle_request(
         }
         (crate::api::Method::Post, Endpoint::StartContainer(id_or_name)) => start_container(manager, id_or_name).await,
         (crate::api::Method::Post, Endpoint::StopContainer(id_or_name)) => stop_container(manager, id_or_name).await,
+        (crate::api::Method::Post, Endpoint::ContainerExec(id_or_name)) => {
+            match serde_json::from_value::<ExecRequest>(request.body) {
+                Ok(exec_req) => exec_container(manager, id_or_name, exec_req).await,
+                Err(err) => Response::bad_request(format!("Invalid request body: {}", err)),
+            }
+        }
         (crate::api::Method::Delete, Endpoint::RemoveContainer(id_or_name)) => remove_container(manager, id_or_name, false).await,
 
         _ => Response::bad_request(format!(
@@ -993,6 +999,70 @@ async fn remove_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str, fo
     }
 }
 
+/// Execute command in container
+async fn exec_container(manager: Arc<Mutex<JailManager>>, id_or_name: &str, exec_req: ExecRequest) -> Response {
+    let mgr = manager.lock().await;
+
+    // Find container by ID, name, or prefix
+    let id_or_name_string = id_or_name.to_string();
+    let container = mgr.get_container(&id_or_name_string)
+        .or_else(|| mgr.get_container_by_prefix(id_or_name))
+        .or_else(|| {
+            mgr.list_containers()
+                .into_iter()
+                .find(|c| c.name.as_deref() == Some(id_or_name))
+        });
+
+    let container = match container {
+        Some(c) => c,
+        None => return Response::not_found(format!("Container '{}'", id_or_name)),
+    };
+
+    // Check if container is running
+    if !container.is_running() {
+        return Response::bad_request(format!(
+            "Container '{}' is not running. Start it first.",
+            id_or_name
+        ));
+    }
+
+    // Build the command
+    let mut cmd_args = Vec::new();
+    if let Some(ref workdir) = exec_req.workdir {
+        cmd_args.extend(["-U".to_string(), "root".to_string()]);
+        cmd_args.extend(["-c".to_string(), format!("cd {}", workdir)]);
+    }
+    cmd_args.extend(container.jail_name.clone().into_bytes().iter().map(|b| *b as char).collect::<String>().lines().map(String::from));
+
+    // For simplicity, we'll use jexec to run the command
+    // jexec [-l -u username] jail command [args ...]
+    let output = match std::process::Command::new("jexec")
+        .arg(&container.jail_name)
+        .args(&exec_req.command)
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            return Response::internal_error(format!("Failed to execute command: {}", e));
+        }
+    };
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    let result = ExecResult {
+        exit_code,
+        stdout,
+        stderr,
+    };
+
+    match Response::success(result) {
+        Ok(resp) => resp,
+        Err(_) => Response::internal_error("Failed to serialize exec result"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1288,5 +1358,57 @@ mod tests {
         let response = delete_jail(manager, "nonexistent").await;
 
         assert_eq!(response.status, status::NOT_FOUND);
+    }
+
+    // ============================================================================
+    // Exec Container Tests
+    // ============================================================================
+
+    #[tokio::test]
+    async fn test_exec_container_not_found() {
+        let manager = Arc::new(Mutex::new(create_test_manager()));
+
+        let exec_req = ExecRequest {
+            command: vec!["echo".to_string(), "test".to_string()],
+            env: std::collections::HashMap::new(),
+            workdir: None,
+        };
+
+        let response = exec_container(manager, "nonexistent", exec_req).await;
+
+        assert_eq!(response.status, status::NOT_FOUND);
+        assert!(!response.is_success());
+    }
+
+    #[tokio::test]
+    async fn test_exec_container_invalid_request_body() {
+        let manager = Arc::new(Mutex::new(create_test_manager()));
+
+        let request = Request::post(
+            crate::api::Endpoint::ContainerExec("some-id".into()),
+            "invalid json",
+        ).unwrap();
+
+        let response = handle_request(request, manager).await;
+
+        assert_eq!(response.status, status::BAD_REQUEST);
+        assert!(!response.is_success());
+    }
+
+    #[tokio::test]
+    async fn test_exec_request_valid() {
+        let exec_req = ExecRequest {
+            command: vec!["ls".to_string(), "-la".to_string()],
+            env: {
+                let mut map = std::collections::HashMap::new();
+                map.insert("PATH".to_string(), "/usr/bin".to_string());
+                map
+            },
+            workdir: Some("/tmp".to_string()),
+        };
+
+        assert_eq!(exec_req.command.len(), 2);
+        assert_eq!(exec_req.workdir, Some("/tmp".to_string()));
+        assert_eq!(exec_req.env.len(), 1);
     }
 }

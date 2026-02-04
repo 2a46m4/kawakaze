@@ -61,8 +61,13 @@ kawakaze/
     │   ├── handler.rs      # API request handlers
     │   ├── jail.rs         # Jail lifecycle management
     │   ├── lib.rs          # Library entry point & JailManager
+    │   ├── networking.rs   # Network management (bridge, epair, NAT, IP allocation)
     │   ├── server.rs       # Unix socket server
     │   ├── store.rs        # SQLite persistence layer
+    │   ├── zfs.rs          # ZFS dataset management
+    │   ├── image.rs        # Image data structures
+    │   ├── image_builder.rs # Dockerfile-to-image builder
+    │   └── container.rs    # Container lifecycle and management
     │   └── bin/
     │       └── kawakazed.rs # Backend daemon binary
     ├── tests/
@@ -128,6 +133,8 @@ Key modules:
 - `server.rs` - Unix socket server with JsonCodec
 - `store.rs` - SQLite persistence layer
 - `bootstrap.rs` - FreeBSD base system bootstrapping
+- `networking.rs` - Network management (bridge, epair, NAT, IP allocation, port forwarding)
+- `zfs.rs` - ZFS dataset operations
 - `image_builder.rs` - Dockerfile-to-image builder with ZFS layer management
 - `image.rs` - Image data structures and Dockerfile instruction types
 - `container.rs` - Container lifecycle and management
@@ -282,6 +289,108 @@ kawakaze exec <container-id> uname -a
 kawakaze exec <container-id> ls -la /root
 ```
 
+## Container Networking
+
+Kawakaze provides network connectivity for containers using FreeBSD's VNET, epair interfaces, and bridge networking. Each container receives an IP address from the `10.11.0.0/16` network.
+
+### Network Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                       Host                              │
+│  ┌─────────────────────────────────────────────────┐  │
+│  │  bridge0 (10.11.0.1/16)                        │  │
+│  │  ├─ epair0a ──────── epair0b → Container 1     │  │
+│  │  ├─ epair1a ──────── epair1b → Container 2     │  │
+│  │  └─ ...                                         │  │
+│  └─────────────────────────────────────────────────┘  │
+│                        │                               │
+│                        ▼                               │
+│              pf (NAT to external interface)            │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Network Components
+
+**IP Allocator:**
+- Automatically allocates IP addresses from 10.11.0.0/16
+- 10.11.0.1 is reserved for the bridge
+- Container IPs start at 10.11.0.2
+- State is persisted in `/var/db/kawakaze/ip_allocations.txt`
+
+**Bridge Interface (bridge0):**
+- Created automatically when the backend starts
+- IP: 10.11.0.1/16
+- Acts as the gateway for all containers
+- Member interfaces: epair0a, epair1a, etc.
+
+**epair Interfaces:**
+- Ethernet virtual pair devices for container networking
+- Each container gets an epair (e.g., epair0a/epair0b)
+- `epairXa` stays on the host and attaches to bridge0
+- `epairXb` is moved to the container's VNET
+
+**NAT/pf:**
+- Outbound NAT is configured using pf (Packet Filter)
+- Automatically detects the default network interface
+- NAT rule: `nat on $ext_if from 10.11.0.0/16 to any -> ($ext_if)`
+- pf anchor: `kawakaze` for NAT rules
+
+**Port Forwarding:**
+- Port mappings are configured using pf rdr rules
+- pf anchor: `kawakaze_forwarding` for port forwarding
+- Supports both TCP and UDP protocols
+- Example: `rdr pass on bridge0 inet proto tcp from any to any port 8080 -> 10.11.0.2 port 80`
+
+### Network Configuration
+
+When a container is created:
+1. An IP address is automatically allocated from the pool
+2. An epair interface pair is created
+3. The `epairXa` side is attached to bridge0
+4. When the container starts, `epairXb` is moved to the jail's VNET
+5. IP address is configured inside the jail
+6. Default route (10.11.0.1) is configured
+
+### Current Limitations
+
+**VNET Jail Support:**
+The networking infrastructure is fully implemented, but there is one remaining limitation:
+
+- Jails need to be created with the `vnet` parameter for proper network isolation
+- Currently, containers share the host's network stack view
+- The fix requires modifying jail creation to support two-phase initialization:
+  1. Create jail with `vnet` parameter
+  2. Attach epair to jail's VNET before starting
+  3. Configure network inside the jail
+
+This means that while the bridge, epairs, IP allocation, and NAT rules are all working correctly, containers currently see the host's network interfaces rather than having an isolated network stack.
+
+### Usage Examples
+
+**Create a container (gets automatic IP):**
+```bash
+kawakaze run freebsd-15.0-release --name mycontainer
+# Container receives IP: 10.11.0.2
+```
+
+**Create a container with port forwarding:**
+```bash
+kawakaze run -p 8080:80 freebsd-15.0-release
+# Maps host port 8080 to container port 80
+```
+
+**Inspect container network info:**
+```bash
+kawakaze inspect <container-id>
+# Shows IP address, port mappings, etc.
+```
+
+**Network state files:**
+- IP allocations: `/var/db/kawakaze/ip_allocations.txt`
+- pf NAT rules: `pfctl -a kawakaze -s rules`
+- pf port forwarding: `pfctl -a kawakaze_forwarding -s rules`
+
 ## Dockerfile Instructions
 
 Kawakaze supports a subset of Dockerfile instructions for building images:
@@ -334,9 +443,12 @@ WORKDIR /workspace
 ENV PATH=/usr/local/bin:$PATH
 VOLUME /workspace
 ```
+
+# Extra instructions
 - Always use descriptive names
 - After finishing a feature, make sure to write unit tests, integration tests, and system tests for it. You should test the behaviour of every edge case you can think of to make sure that it's as expected. Use additional test case libraries, or coverage libraries if you need to.
 - Update CLAUDE.md if the information is out of date or if there is anything important that is added
 - Write unit, integration, and system tests for any code that you write. Make sure that all paths are covered.
 - Commit the code whenever a feature has been added and it's been thoroughly tested.
 - You don't need to preserve any backwards compatibility or worry about deleting existing containers or images.
+- think slowly and carefully and only write code when you are sure.

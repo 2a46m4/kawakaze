@@ -398,7 +398,24 @@ kawakaze inspect <container-id>
 
 Kawakaze automatically configures pf (Packet Filter) rules for NAT and port forwarding when the backend starts. However, pf must be enabled on the system for this to work.
 
-**Enable pf on FreeBSD:**
+**Automated Setup (Recommended):**
+
+Use the provided setup script to automate pf configuration:
+
+```bash
+# Run the automated setup script
+sudo ./scripts/setup-pf.sh
+```
+
+The script will:
+- Check pf status and enable it at boot if needed
+- Start pf service if not running
+- Optionally create a basic `/etc/pf.conf` with Kawakaze anchors
+- Display final pf status and rules
+
+See `scripts/README.md` for more details.
+
+**Manual Setup:**
 
 1. **Enable pf at boot:**
 ```bash

@@ -339,8 +339,9 @@ Kawakaze provides network connectivity for containers using FreeBSD's VNET, epai
 **Port Forwarding:**
 - Port mappings are configured using pf rdr rules
 - pf anchor: `kawakaze_forwarding` for port forwarding
+- Redirects from the external interface (e.g., vtnet0) to container IPs
 - Supports both TCP and UDP protocols
-- Example: `rdr pass on bridge0 inet proto tcp from any to any port 8080 -> 10.11.0.2 port 80`
+- Example: `rdr pass on vtnet0 inet proto tcp from any to any port 8080 -> 10.11.0.2 port 80`
 
 ### Network Configuration
 
@@ -392,6 +393,78 @@ kawakaze inspect <container-id>
 - IP allocations: `/var/db/kawakaze/ip_allocations.txt`
 - pf NAT rules: `pfctl -a kawakaze -s rules`
 - pf port forwarding: `pfctl -a kawakaze_forwarding -s rules`
+
+### Setting Up pf on a New Server
+
+Kawakaze automatically configures pf (Packet Filter) rules for NAT and port forwarding when the backend starts. However, pf must be enabled on the system for this to work.
+
+**Enable pf on FreeBSD:**
+
+1. **Enable pf at boot:**
+```bash
+sysrc pf_enable="YES"
+```
+
+2. **Start pf immediately:**
+```bash
+service pf start
+```
+
+3. **Verify pf is running:**
+```bash
+pfctl -s info
+# Should show: Status: Enabled
+```
+
+**How Kawakaze Uses pf:**
+
+Kawakaze manages two pf anchors:
+
+1. **NAT Anchor (`kawakaze`)**: Provides outbound NAT for containers
+   - Automatically detects the external interface
+   - Rule: `nat on $ext_if from 10.11.0.0/16 to any -> ($ext_if)`
+   - View rules: `pfctl -a kawakaze -s nat`
+
+2. **Port Forwarding Anchor (`kawakaze_forwarding`)**: Handles port redirection
+   - Redirects external ports to container ports
+   - Example: `rdr pass on vtnet0 inet proto tcp from any to any port 8080 -> 10.11.0.2 port 80`
+   - View rules: `pfctl -a kawakaze_forwarding -s nat`
+
+**Manual pf Configuration (Optional):**
+
+If you need custom pf rules beyond what Kawakaze provides, create `/etc/pf.conf`:
+
+```pf
+# Basic pf.conf for Kawakaze
+ext_if="vtnet0"  # External interface (adjust to your system)
+
+# Allow all traffic on loopback
+set skip on lo0
+
+# Allow traffic from Kawakaze containers
+# (Kawakaze manages its own NAT and port forwarding via anchors)
+anchor "kawakaze/*"
+
+# Default deny policy (optional - add your own rules as needed)
+block in all
+pass out all keep state
+```
+
+Load the configuration:
+```bash
+pfctl -f /etc/pf.conf
+```
+
+**Troubleshooting pf:**
+
+- Check pf status: `pfctl -s info`
+- View all NAT rules: `pfctl -s nat`
+- View all rules: `pfctl -s rules`
+- View anchor rules: `pfctl -a kawakaze -s rules`
+- Monitor pf statistics: `pfctl -s info`
+- Enable debug logging: `pfctl -x debug` (disable with `pfctl -x none`)
+
+**Note:** Kawakaze automatically creates and manages pf anchors. You don't need to manually configure NAT or port forwarding rules unless you have specific requirements beyond what Kawakaze provides.
 
 ## Dockerfile Instructions
 

@@ -352,19 +352,21 @@ When a container is created:
 5. IP address is configured inside the jail
 6. Default route (10.11.0.1) is configured
 
-### Current Limitations
+### VNET Implementation
 
-**VNET Jail Support:**
-The networking infrastructure is fully implemented, but there is one remaining limitation:
+**VNET jail support is fully implemented and working.** Containers have complete network stack isolation using FreeBSD's VNET functionality.
 
-- Jails need to be created with the `vnet` parameter for proper network isolation
-- Currently, containers share the host's network stack view
-- The fix requires modifying jail creation to support two-phase initialization:
-  1. Create jail with `vnet` parameter
-  2. Attach epair to jail's VNET before starting
-  3. Configure network inside the jail
+**How it works:**
+1. When a container is created with networking enabled, the jail is created with the `vnet` parameter
+2. The epair interface is assigned during jail creation using `vnet.interface=epairXb`
+3. The epair is automatically moved into the jail's VNET during creation
+4. IP address and default route are configured inside the jail
+5. The container has an isolated network stack and only sees its own `lo0` and `epairXb` interfaces
 
-This means that while the bridge, epairs, IP allocation, and NAT rules are all working correctly, containers currently see the host's network interfaces rather than having an isolated network stack.
+**Key implementation details:**
+- The `vnet.interface` parameter is used during jail creation (not `ifconfig -vnet` after creation)
+- This approach works reliably on FreeBSD 15.0 without any retry logic
+- See `TODO_VNET.md` for complete implementation details and testing results
 
 ### Usage Examples
 
@@ -452,3 +454,4 @@ VOLUME /workspace
 - Commit the code whenever a feature has been added and it's been thoroughly tested.
 - You don't need to preserve any backwards compatibility or worry about deleting existing containers or images.
 - think slowly and carefully and only write code when you are sure.
+- Don't stop until you've finished your task.

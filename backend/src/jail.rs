@@ -14,6 +14,7 @@ pub struct Jail {
     state: JailState,
     path: Option<String>,
     ip: Option<String>,
+    vnet_interface: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +45,7 @@ impl Jail {
             state: JailState::Created,
             path: None,
             ip: None,
+            vnet_interface: None,
         })
     }
 
@@ -57,6 +59,13 @@ impl Jail {
     /// Set the jail IP address
     pub fn with_ip(mut self, ip: &str) -> Result<Self, JailError> {
         self.ip = Some(ip.to_string());
+        Ok(self)
+    }
+
+    /// Set the VNET interface (e.g., "epair0b")
+    /// This interface will be automatically moved into the jail during creation
+    pub fn with_vnet_interface(mut self, interface: &str) -> Result<Self, JailError> {
+        self.vnet_interface = Some(interface.to_string());
         Ok(self)
     }
 
@@ -103,7 +112,16 @@ impl Jail {
             // Get the jail path for devfs mounting
             let jail_path = self.path.clone().unwrap_or_else(|| format!("/tmp/{}", self.name));
 
-            self.jid = create_freebsd_jail(&self.name, self.path.as_deref(), self.ip.as_deref())?;
+            // VNET is enabled when an IP is allocated
+            let vnet = self.ip.is_some();
+
+            self.jid = create_freebsd_jail(
+                &self.name,
+                self.path.as_deref(),
+                self.ip.as_deref(),
+                self.vnet_interface.as_deref(),
+                vnet
+            )?;
 
             // Mount devfs inside the jail for device access (needed by commands like top)
             mount_devfs(&self.name, &jail_path)?;
@@ -305,6 +323,7 @@ impl Jail {
             state,
             path: row.path,
             ip: row.ip,
+            vnet_interface: None,
         })
     }
 
@@ -368,8 +387,124 @@ fn is_root() -> bool {
 mod freebsd {
     use super::*;
 
-    /// Create a FreeBSD jail using jail_set system call
+    /// Create a FreeBSD jail using jail_set system call or jail command
+    ///
+    /// For VNET jails, we use the `jail` command because jail_set() requires
+    /// JAIL_ATTACH when creating VNET jails, which would attach the backend
+    /// process to the jail.
+    ///
+    /// For non-VNET jails, we use jail_set() directly for better control.
     pub fn create_freebsd_jail(
+        name: &str,
+        path: Option<&str>,
+        ip: Option<&str>,
+        vnet_interface: Option<&str>,
+        vnet: bool,
+    ) -> Result<i32, JailError> {
+        // For VNET jails, use the jail command instead of jail_set()
+        if vnet {
+            return create_freebsd_jail_with_command(name, path, ip, vnet_interface);
+        }
+
+        // For non-VNET jails, use jail_set() system call
+        create_freebsd_jail_with_syscall(name, path, ip)
+    }
+
+    /// Create a VNET jail using the jail command
+    fn create_freebsd_jail_with_command(
+        name: &str,
+        path: Option<&str>,
+        ip: Option<&str>,
+        vnet_interface: Option<&str>,
+    ) -> Result<i32, JailError> {
+        use std::process::Command;
+
+        // Determine path - use /tmp/jailname if not specified
+        let default_path = format!("/tmp/{}", name);
+        let jail_path = path.unwrap_or(&default_path);
+
+        // Create jail directory if it doesn't exist
+        if let Err(e) = fs::create_dir_all(jail_path) {
+            return Err(JailError::CreationFailed(format!(
+                "Failed to create jail directory '{}': {}",
+                jail_path, e
+            )));
+        }
+
+        // Build the jail command
+        // jail -c name=<name> path=<path> host.hostname=<name> persist vnet [vnet.interface=<iface>]
+        // Note: For VNET jails, we do NOT pass ip4.addr to the jail command.
+        // The IP will be configured on the epair interface by the networking module.
+        let mut cmd = Command::new("jail");
+        cmd.arg("-c");
+        cmd.arg(format!("name={}", name));
+        cmd.arg(format!("path={}", jail_path));
+        cmd.arg(format!("host.hostname={}", name));
+        cmd.arg("persist");
+        cmd.arg("vnet");
+
+        // If vnet_interface is specified, add it as a parameter
+        // This is the KEY FIX: using vnet.interface=<epairXb> during jail creation
+        // moves the epair into the jail DURING creation, which works reliably
+        if let Some(iface) = vnet_interface {
+            cmd.arg(format!("vnet.interface={}", iface));
+        }
+
+        tracing::debug!("Creating VNET jail with command: {:?}", cmd);
+
+        // Execute the jail command
+        let output = cmd.output()
+            .map_err(|e| JailError::CreationFailed(format!(
+                "Failed to execute jail command: {}", e
+            )))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(JailError::CreationFailed(format!(
+                "jail command failed: {}", stderr
+            )));
+        }
+
+        // Get the JID by name
+        let jid = get_jid_by_name(name)?;
+
+        tracing::debug!("Created VNET jail '{}' with JID: {}", name, jid);
+        Ok(jid)
+    }
+
+    /// Get the JID of a jail by its name using jail_get system call
+    fn get_jid_by_name(name: &str) -> Result<i32, JailError> {
+        let name_cstring = CString::new(name)?;
+        let name_param = CString::new("name").unwrap();
+
+        let iovs = [
+            libc::iovec {
+                iov_base: name_param.as_ptr() as *mut libc::c_void,
+                iov_len: name_param.as_bytes().len() + 1,
+            },
+            libc::iovec {
+                iov_base: name_cstring.as_ptr() as *mut libc::c_void,
+                iov_len: name.len() + 1,
+            },
+        ];
+
+        let jid = unsafe {
+            libc::jail_get(iovs.as_ptr() as *mut libc::iovec, iovs.len() as libc::c_uint, 0)
+        };
+
+        if jid < 0 {
+            return Err(JailError::CreationFailed(format!(
+                "Failed to get JID for jail '{}': {}",
+                name,
+                std::io::Error::last_os_error()
+            )));
+        }
+
+        Ok(jid)
+    }
+
+    /// Create a non-VNET jail using jail_set system call
+    fn create_freebsd_jail_with_syscall(
         name: &str,
         path: Option<&str>,
         ip: Option<&str>,

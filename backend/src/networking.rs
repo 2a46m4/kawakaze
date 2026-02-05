@@ -12,6 +12,8 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
 use std::fs;
+use std::thread;
+use std::time::Duration;
 use tracing::{debug, info, warn, error};
 
 const BRIDGE_NAME: &str = "bridge0";
@@ -516,6 +518,62 @@ impl NetworkManager {
         Ok(())
     }
 
+    /// Move epair interface to VNET jail with retry logic
+    ///
+    /// This function retries the epair attachment with exponential backoff.
+    /// VNET jails may not be fully initialized immediately after creation,
+    /// so we wait briefly before the first attempt and retry multiple times.
+    /// Note: With ZFS atime=off, VNET initialization is now fast (<1 second).
+    fn move_epair_to_vnet_jail(
+        &self,
+        epair: &str,
+        jail_name: &str,
+    ) -> Result<(), NetworkError> {
+        const MAX_ATTEMPTS: u32 = 10;
+
+        // VNET jails need brief time to initialize after creation
+        // With atime=off on ZFS datasets, initialization is now fast
+        info!("Waiting briefly for VNET jail {} to initialize...", jail_name);
+        thread::sleep(Duration::from_millis(500));
+
+        let mut delay = Duration::from_millis(500); // Start with 500ms delay
+
+        for attempt in 1..=MAX_ATTEMPTS {
+            let output = Command::new("ifconfig")
+                .arg(epair)
+                .arg("-vnet")
+                .arg(jail_name)
+                .output()?;
+
+            if output.status.success() {
+                info!("Successfully moved {} to jail {} on attempt {}", epair, jail_name, attempt);
+                return Ok(());
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            // Check if this is a timing-related error (Device not configured)
+            if stderr.contains("Device not configured") && attempt < MAX_ATTEMPTS {
+                info!(
+                    "Attempt {}/{}: Failed to move {} to jail {} ({}). Retrying after {:?}...",
+                    attempt, MAX_ATTEMPTS, epair, jail_name, stderr.trim(), delay
+                );
+                thread::sleep(delay);
+                // Exponential backoff with a cap at 5 seconds
+                delay = std::cmp::min(delay * 2, Duration::from_secs(5));
+                continue;
+            }
+
+            // Either it's not a retryable error or we've exhausted attempts
+            return Err(NetworkError::EpairAttachmentFailed(format!(
+                "Failed to move {} to jail {} after {} attempt(s): {}",
+                epair, jail_name, attempt, stderr
+            )));
+        }
+
+        unreachable!()
+    }
+
     /// Configure network inside a jail
     pub fn configure_jail_network(
         &self,
@@ -524,19 +582,8 @@ impl NetworkManager {
     ) -> Result<(), NetworkError> {
         info!("Configuring network for jail {}", jail_name);
 
-        // Move epair_b into the jail
-        let output = Command::new("ifconfig")
-            .arg(&network.epair_jail)
-            .arg("-vnet")
-            .arg(jail_name)
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(NetworkError::EpairAttachmentFailed(format!(
-                "Failed to move {} to jail {}: {}", network.epair_jail, jail_name, stderr
-            )));
-        }
+        // Note: The epair interface is already moved into the jail via vnet.interface
+        // parameter during jail creation. We only need to configure the IP and routing.
 
         // Configure IP address inside the jail using jexec
         let output = Command::new("jexec")

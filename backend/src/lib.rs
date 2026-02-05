@@ -732,27 +732,45 @@ impl JailManager {
         }
 
         // Allocate network resources if network manager is available
-        let container_ip = if let Some(ref mut network_manager) = self.network_manager {
+        let (container_ip, epair_jail) = if let Some(ref mut network_manager) = self.network_manager {
             match network_manager.allocate_network(&jail_name) {
                 Ok(network) => {
                     let ip = network.ip.clone();
+                    let epair_jail = network.epair_jail.clone();
                     self.container_networks.insert(container_id.clone(), network);
-                    info!("Allocated IP {} for container {}", ip, container_id);
-                    Some(ip)
+                    info!("Allocated IP {} for container {} (epair: {})", ip, container_id, epair_jail);
+                    (Some(ip), Some(epair_jail))
                 }
                 Err(e) => {
                     warn!("Failed to allocate network for container {}: {}. Container will have no networking.", container_id, e);
-                    None
+                    (None, None)
                 }
             }
         } else {
             info!("No network manager available, container {} will have no networking", container_id);
-            None
+            (None, None)
         };
 
         // Create the FreeBSD jail with the mounted path
+        // Set IP if allocated (VNET is automatically enabled when IP is set)
         let jail = crate::jail::Jail::create(&jail_name)
             .and_then(|j| j.with_path(&container_mountpoint))
+            .and_then(|j| {
+                // Set IP if allocated (this automatically enables VNET)
+                if let Some(ref ip) = container_ip {
+                    j.with_ip(ip)
+                } else {
+                    Ok(j)
+                }
+            })
+            .and_then(|j| {
+                // Set VNET interface if allocated (epair that goes into the jail)
+                if let Some(ref epair) = epair_jail {
+                    j.with_vnet_interface(epair)
+                } else {
+                    Ok(j)
+                }
+            })
             .map_err(|e| StoreError::SerializationError(format!("Failed to create jail: {}", e)))?;
 
         // Add to jails HashMap

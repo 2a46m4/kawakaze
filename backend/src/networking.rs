@@ -429,8 +429,10 @@ impl NetworkManager {
         for line in stdout.lines() {
             if line.starts_with("default") || line.starts_with("0.0.0.0") {
                 let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 8 {
-                    return Ok(Some(parts[7].to_string())); // Interface is typically the 8th column
+                // FreeBSD netstat format: Destination Gateway Flags Netif [Expire]
+                // Interface is typically at index 3 (4th column)
+                if parts.len() >= 4 {
+                    return Ok(Some(parts[3].to_string()));
                 }
             }
         }
@@ -657,10 +659,15 @@ impl NetworkManager {
         info!("Setting up port forwarding: {} -> {}:{} ({})",
               host_port, container_ip, container_port, protocol);
 
+        // Get the external interface for rdr
+        let external_iface = self.get_default_interface()?
+            .ok_or_else(|| NetworkError::PfError("Could not determine external interface".into()))?;
+
         // rdr pass on $ext_if inet proto tcp from any to any port $host_port -> $container_ip port $container_port
+        // We use the external interface so external traffic can reach the container
         let rule = format!(
             "rdr pass on {} inet proto {} from any to any port {} -> {} port {}\n",
-            BRIDGE_NAME, protocol, host_port, container_ip, container_port
+            external_iface, protocol, host_port, container_ip, container_port
         );
 
         let output = Command::new("pfctl")
@@ -688,7 +695,7 @@ impl NetworkManager {
             )));
         }
 
-        info!("Port forwarding configured successfully");
+        info!("Port forwarding configured successfully on interface {}", external_iface);
         Ok(())
     }
 

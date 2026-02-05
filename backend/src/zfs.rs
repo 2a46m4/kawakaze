@@ -194,6 +194,23 @@ impl Zfs {
             )));
         }
 
+        // Set atime=off to improve VNET jail initialization performance
+        // With atime=on, every read access updates the access time, causing
+        // significant slowdown during VNET initialization (3+ minutes vs immediate)
+        let output = Command::new("zfs")
+            .arg("set")
+            .arg("atime=off")
+            .arg(dataset)
+            .output()?;
+
+        if !output.status.success() {
+            let error_msg = String::from_utf8_lossy(&output.stderr);
+            return Err(ZfsError::CommandFailed(format!(
+                "Failed to set atime for '{}': {}",
+                dataset, error_msg
+            )));
+        }
+
         // Ensure the mountpoint directory exists
         std::fs::create_dir_all(mountpoint).map_err(|e| ZfsError::CommandFailed(format!("Failed to create mountpoint directory: {}", e)))?;
 
